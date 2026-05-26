@@ -223,7 +223,7 @@ async def start(m: Message):
 
 @router.message(lambda m: m.text == "➕ Add Wallet")
 async def add_ui(m: Message):
-    await m.answer("Send wallet address to monitor 👇")
+    await m.answer("Send SOL wallet address to monitor 👇")
 
 @router.message(lambda m: m.text == "📋 My Wallets")
 async def list_ui(m: Message):
