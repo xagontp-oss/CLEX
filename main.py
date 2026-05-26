@@ -1,6 +1,3 @@
-# main.py - Enhanced Production Solana Buy Alert Bot
-# Same features, improved speed + accuracy + stability
-
 import asyncio
 import aiosqlite
 import logging
@@ -10,7 +7,7 @@ from typing import Optional, Dict, Any, List
 from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, Router
-from aiogram.types import Message
+from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.filters import Command
 from aiogram.enums import ParseMode
 
@@ -38,6 +35,26 @@ bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 router = Router()
 dp.include_router(router)
+
+# ================= FUN ASCII BANNER =================
+BANNER = """
+██████╗           ███╗   ███╗██████╗ 
+██╔══██╗██╔   ═██╗████╗ ████║██╔══██╗
+██████╔╝██║   ██║██╔████╔██║██████╔╝
+██╔═══╝ ██║   ██║██║╚██╔╝██║██╔═══╝ 
+██║     ╚██████╔╝██║ ╚═╝ ██║██║     
+╚═╝      ╚═════╝ ╚═╝     ╚═╝╚═╝     
+
+"""
+
+# ================= MENU =================
+menu = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="➕ Add Wallet"), KeyboardButton(text="📋 My Wallets")],
+        [KeyboardButton(text="❌ Delete Wallet"), KeyboardButton(text="ℹ️ Help")]
+    ],
+    resize_keyboard=True
+)
 
 # ================= DATABASE =================
 async def init_db():
@@ -73,13 +90,8 @@ async def get_all():
         cur = await db.execute("SELECT user_id, solana_address, custom_message FROM addresses")
         return await cur.fetchall()
 
-# ================= FAST SWAP EXTRACTION =================
+# ================= IMPROVED SWAP DETECTION =================
 def extract_buy_info(tx: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """
-    Fast + accurate Helius swap extractor
-    Focus: tokenTransfers only (fastest reliable signal)
-    """
-
     try:
         transfers = tx.get("tokenTransfers", [])
         signature = tx.get("signature")
@@ -87,32 +99,26 @@ def extract_buy_info(tx: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if not transfers:
             return None
 
-        # fastest path: filter valid received tokens
-        best_mint = None
-        best_amount = 0
+        received = []
 
         for t in transfers:
-            mint = t.get("mint")
-            amt = t.get("tokenAmount")
-
-            if not mint or not amt:
+            try:
+                amt = float(t.get("tokenAmount") or 0)
+            except:
                 continue
 
-            # ignore tiny dust transfers
-            if amt <= 0:
-                continue
+            if amt > 0 and t.get("toUserAccount"):
+                received.append((t.get("mint"), amt))
 
-            # pick largest received token = actual buy
-            if amt > best_amount:
-                best_amount = amt
-                best_mint = mint
-
-        if not best_mint:
+        if not received:
             return None
 
+        # biggest received token = bought coin
+        mint, amt = max(received, key=lambda x: x[1])
+
         return {
-            "ca": best_mint,
-            "amount": best_amount,
+            "ca": mint,
+            "amount": amt,
             "signature": signature,
             "timestamp": tx.get("timestamp", int(datetime.now().timestamp()))
         }
@@ -121,14 +127,40 @@ def extract_buy_info(tx: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         logger.error(f"extract error: {e}")
         return None
 
-# ================= FAST WEBHOOK PROCESSOR =================
-async def process_payload(payload: List[Dict[str, Any]]):
-    """
-    Optimized:
-    - no DB queries inside loop
-    - preloaded map once per request
-    """
+# ================= HUMAN ALERT FORMAT =================
+async def send_alert(user_id, wallet, buy, custom_msg):
+    text = f"""
+{BANNER}
 
+🚨 NEW PUMP.FUN BUY DETECTED 🚨
+
+👛 Wallet:
+{wallet}
+
+🪙 Token CA:
+{buy['ca']}
+
+💰 Amount Bought:
+{buy['amount']}
+
+🧠 Info:
+{custom_msg}
+
+🔗 Tx:
+https://solscan.io/tx/{buy['signature']}
+
+━━━━━━━━━━━━━━━━━━━━
+"""
+
+    await bot.send_message(
+        user_id,
+        text,
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True
+    )
+
+# ================= PROCESSOR =================
+async def process_payload(payload: List[Dict[str, Any]]):
     if not isinstance(payload, list):
         return
 
@@ -148,65 +180,47 @@ async def process_payload(payload: List[Dict[str, Any]]):
 
         user_id, custom_msg = address_map[wallet]
 
-        text = (
-            f"🔔 BUY DETECTED\n\n"
-            f"Wallet: {wallet}\n"
-            f"CA: {buy['ca']}\n"
-            f"Amount: {buy['amount']}\n"
-            f"{custom_msg}\n\n"
-            f"https://solscan.io/tx/{buy['signature']}"
-        )
+        await send_alert(user_id, wallet, buy, custom_msg)
 
-        try:
-            await bot.send_message(
-                user_id,
-                text,
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True
-            )
-        except Exception as e:
-            logger.error(f"Telegram send error: {e}")
-
-# ================= TELEGRAM COMMANDS =================
+# ================= TELEGRAM UI =================
 @router.message(Command("start"))
 async def start(m: Message):
-    await m.answer("Bot running.\nUse /add /delete /list")
+    await m.answer(BANNER + "\nWelcome to Pump.fun Tracker Bot 🚀", reply_markup=menu)
 
-@router.message(Command("add"))
-async def add(m: Message):
-    parts = m.text.split(maxsplit=2)
-    if len(parts) < 2:
-        return await m.answer("Usage: /add <address>")
+@router.message(lambda m: m.text == "➕ Add Wallet")
+async def add_ui(m: Message):
+    await m.answer("Send wallet address to monitor 👇")
 
-    await add_address(m.from_user.id, parts[1], parts[2] if len(parts) > 2 else "New buy detected!")
-    await m.answer("Added.")
-
-@router.message(Command("delete"))
-async def delete(m: Message):
-    parts = m.text.split()
-    if len(parts) != 2:
-        return await m.answer("Usage: /delete <address>")
-
-    await delete_address(m.from_user.id, parts[1])
-    await m.answer("Deleted.")
-
-@router.message(Command("list"))
-async def list_cmd(m: Message):
+@router.message(lambda m: m.text == "📋 My Wallets")
+async def list_ui(m: Message):
     data = await get_all()
     user = [d for d in data if d[0] == m.from_user.id]
 
     if not user:
-        return await m.answer("No addresses.")
+        return await m.answer("No wallets tracked.")
 
-    text = "\n".join([f"{x[1]} | {x[2]}" for x in user])
+    text = "📊 Your Monitored Wallets:\n\n"
+    for u in user:
+        text += f"👛 {u[1]}\n🧠 {u[2]}\n\n"
+
     await m.answer(text)
+
+@router.message(lambda m: m.text == "❌ Delete Wallet")
+async def delete_ui(m: Message):
+    await m.answer("Send wallet address to delete ❌")
+
+@router.message(lambda m: m.text and len(m.text) > 30)
+async def handle_wallet_input(m: Message):
+    # auto add/delete simplified UX
+    await add_address(m.from_user.id, m.text, "Pump.fun tracking active 🔥")
+    await m.answer("Wallet added to tracker 🚀", reply_markup=menu)
 
 # ================= FASTAPI =================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
     asyncio.create_task(dp.start_polling(bot))
-    logger.info("Bot running")
+    logger.info("Pump.fun bot running")
     yield
     await bot.session.close()
 
@@ -218,15 +232,13 @@ async def webhook(req: Request):
         raise HTTPException(403)
 
     payload = await req.json()
-
-    # fire-and-forget (fast response to Helius)
     asyncio.create_task(process_payload(payload))
 
     return {"ok": True}
 
 @app.get("/")
 async def health():
-    return {"status": "ok"}
+    return {"status": "pump.fun bot alive"}
 
 # ================= RUN =================
 if __name__ == "__main__":
