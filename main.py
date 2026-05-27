@@ -194,7 +194,7 @@ async def start(m: Message):
         [InlineKeyboardButton(text="❌ Delete", callback_data="del"),
          InlineKeyboardButton(text="ℹ️ Help", callback_data="help")]
     ])
-    await m.answer("🎯 **CLEX Pump.fun Tracker**\n\nMonitor wallets for buys!\n\nChoose action:", 
+    await m.answer("😈 **CLEX Wallet Tracker**\n\nMonitor insider/whales wallets for buys!\n\nChoose action:", 
                    reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
 
 @router.callback_query(F.data == "add")
