@@ -780,18 +780,26 @@ def escape(s: str) -> str:
 def extract_pump_launch(tx: Dict) -> Optional[Tuple[str, str]]:
     """
     Returns (mint, dev_wallet) if this tx is a pump.fun token creation, else None.
-    Detects by:
-      1. pump program in instructions
-      2. A new mint account appears in accountData
-      3. feePayer = dev
     """
-    instructions = tx.get("instructions", [])
-    account_data  = tx.get("accountData", [])
-    dev_wallet    = tx.get("feePayer", "")
-
-    pump_ix = [ix for ix in instructions if ix.get("programId") == PUMP_PROGRAM]
-    if not pump_ix:
+    if tx.get("type") != "CREATE":
         return None
+
+    dev_wallet = tx.get("feePayer", "")
+    account_data = tx.get("accountData", [])
+
+    # Pump.fun mints always end in 'pump'
+    for acct in account_data:
+        addr = acct.get("account", "")
+        if addr.endswith("pump") and len(addr) in (43, 44):
+            return addr, dev_wallet
+
+    # Fallback: check token transfers
+    for t in tx.get("tokenTransfers", []):
+        mint = t.get("mint", "")
+        if mint.endswith("pump"):
+            return mint, dev_wallet
+
+    return None
 
     # Find newly created token mint accounts (native balance went from 0)
     for acct in account_data:
