@@ -919,13 +919,21 @@ async def stats(m: Message):
 async def lifespan(app: FastAPI):
     await init_db()
     await helius_set_pump_watch()
+    # Force-close any existing sessions on Telegram's side
     await bot.delete_webhook(drop_pending_updates=True)
+    await asyncio.sleep(3)  # wait for old instance to fully die
     logger.info("DB ready · webhook synced")
-    poll = asyncio.create_task(dp.start_polling(bot))
+    poll = asyncio.create_task(dp.start_polling(
+        bot,
+        allowed_updates=["message", "callback_query"],
+    ))
     logger.info("Bot live")
     yield
     poll.cancel()
-    await bot.session.close()
+    try:
+        await asyncio.wait_for(bot.session.close(), timeout=5)
+    except:
+        pass
 
 app = FastAPI(lifespan=lifespan)
 
