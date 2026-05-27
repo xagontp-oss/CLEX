@@ -939,9 +939,8 @@ app = FastAPI(lifespan=lifespan)
 
 @app.post("/webhook")
 async def webhook(req: Request):
-    if req.headers.get("x-helius-secret") != WEBHOOK_SECRET:
-        raise HTTPException(403)
     payload = await req.json()
+    logger.info(f"Webhook hit: {len(payload)} txns")
     asyncio.create_task(process_payload(payload))
     return {"ok": True}
 
