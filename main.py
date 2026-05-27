@@ -940,7 +940,7 @@ app = FastAPI(lifespan=lifespan)
 @app.post("/webhook")
 async def webhook(req: Request):
     payload = await req.json()
-    logger.info(f"Webhook hit: {len(payload)} txns")
+    logger.info(f"Webhook hit: {len(payload)} txns, first type: {payload[0].get('type') if payload else 'empty'}, first accounts: {[a.get('account') for a in payload[0].get('accountData', [])[:3]] if payload else []}")
     asyncio.create_task(process_payload(payload))
     return {"ok": True}
 
