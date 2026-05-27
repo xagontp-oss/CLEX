@@ -22,6 +22,8 @@ load_dotenv()
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 HELIUS_API_KEY = os.getenv("HELIUS_API_KEY")
+HELIUS_WEBHOOK_ID = os.getenv("HELIUS_WEBHOOK_ID")
+HELIUS_BASE = "https://api.helius.xyz/v0"
 DB_PATH = "monitored.db"
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change_this")
 
@@ -56,15 +58,61 @@ async def init_db():
         """)
         await db.commit()
 
+# --- Helius webhook helpers ---
+
+async def _helius_get_addresses() -> List[str]:
+    if not HELIUS_WEBHOOK_ID:
+        logger.warning("HELIUS_WEBHOOK_ID not set — skipping webhook sync")
+        return []
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(
+                f"{HELIUS_BASE}/webhooks/{HELIUS_WEBHOOK_ID}",
+                params={"api-key": HELIUS_API_KEY},
+                timeout=aiohttp.ClientTimeout(total=5)
+            ) as r:
+                r.raise_for_status()
+                return (await r.json()).get("accountAddresses", [])
+    except Exception as e:
+        logger.error(f"Helius GET error: {e}")
+        return []
+
+async def _helius_put_addresses(addresses: List[str]):
+    if not HELIUS_WEBHOOK_ID:
+        return
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.put(
+                f"{HELIUS_BASE}/webhooks/{HELIUS_WEBHOOK_ID}",
+                params={"api-key": HELIUS_API_KEY},
+                json={"accountAddresses": addresses},
+                timeout=aiohttp.ClientTimeout(total=5)
+            ) as r:
+                r.raise_for_status()
+    except Exception as e:
+        logger.error(f"Helius PUT error: {e}")
+
+# --- DB wallet functions (now synced to Helius) ---
+
 async def add_wallet(user_id: int, address: str, msg: str):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("INSERT OR REPLACE INTO wallets VALUES (?, ?, ?)", (user_id, address, msg))
         await db.commit()
+    current = await _helius_get_addresses()
+    if address not in current:
+        await _helius_put_addresses(current + [address])
+        logger.info(f"Helius: added {address}")
 
 async def del_wallet(user_id: int, address: str):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("DELETE FROM wallets WHERE user_id=? AND solana_address=?", (user_id, address))
         await db.commit()
+        cur = await db.execute("SELECT 1 FROM wallets WHERE solana_address=? LIMIT 1", (address,))
+        still_tracked = await cur.fetchone()
+    if not still_tracked:
+        current = await _helius_get_addresses()
+        await _helius_put_addresses([a for a in current if a != address])
+        logger.info(f"Helius: removed {address}")
 
 async def get_wallets(user_id: int) -> List[tuple]:
     async with aiosqlite.connect(DB_PATH) as db:
