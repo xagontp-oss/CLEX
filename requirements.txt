@@ -1,0 +1,22 @@
+# Core web framework
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+
+# Telegram bot framework
+aiogram==3.3.0
+aiohttp==3.9.1
+
+# Database
+aiosqlite==0.19.0
+
+# Environment variables
+python-dotenv==1.0.0
+
+# Optional: Rate limiting (for production)
+slowapi==0.1.9
+
+# Optional: Async tools
+asyncio-contextmanager==1.0.0
+
+# Optional: Monitoring/observability (future)
+prometheus-client==0.19.0
