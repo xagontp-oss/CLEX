@@ -919,6 +919,7 @@ async def stats(m: Message):
 async def lifespan(app: FastAPI):
     await init_db()
     await helius_set_pump_watch()
+    await bot.delete_webhook(drop_pending_updates=True)
     logger.info("DB ready · webhook synced")
     poll = asyncio.create_task(dp.start_polling(bot))
     logger.info("Bot live")
