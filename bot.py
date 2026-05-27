@@ -267,7 +267,7 @@ async def handle_input(m: Message):
     if state == "add_wallet":
         if len(text) >= 43 and len(text) <= 44:
             await add_wallet(uid, text, "Pump.fun buy! 🚀")
-            await m.answer("✅ Wallet added!\n\nWaiting for transactions...", 
+            await m.answer("✅ Wallet added!\n\nWaiting for transactions..", 
                           reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Back", callback_data="back")]]))
             user_states[uid] = {"state": "menu"}
         else:
