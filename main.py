@@ -772,6 +772,8 @@ def _bar(score: int) -> str:
 
 def escape(s: str) -> str:
     """Escape MarkdownV2 special chars."""
+    if not s:
+        return ""
     for ch in r"\_*[]()~`>#+-=|{}.!":
         s = s.replace(ch, f"\\{ch}")
     return s
