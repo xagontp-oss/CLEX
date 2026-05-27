@@ -122,14 +122,32 @@ async def helius_set_pump_watch():
         return
     try:
         async with aiohttp.ClientSession() as s:
-            async with s.put(
+            # First GET the existing config so we don't wipe required fields
+            async with s.get(
                 f"{HELIUS_BASE}/webhooks/{HELIUS_WEBHOOK_ID}",
                 params={"api-key": HELIUS_API_KEY},
-                json={"accountAddresses": [PUMP_PROGRAM]},
                 timeout=aiohttp.ClientTimeout(total=8),
             ) as r:
                 r.raise_for_status()
-                logger.info("Helius webhook → watching pump.fun program")
+                existing = await r.json()
+
+            # Merge — keep everything, just overwrite accountAddresses
+            payload = {
+                "webhookURL":       existing.get("webhookURL"),
+                "transactionTypes": existing.get("transactionTypes", ["Any"]),
+                "accountAddresses": [PUMP_PROGRAM],
+                "webhookType":      existing.get("webhookType", "enhanced"),
+                "authHeader":       existing.get("authHeader", WEBHOOK_SECRET),
+            }
+
+            async with s.put(
+                f"{HELIUS_BASE}/webhooks/{HELIUS_WEBHOOK_ID}",
+                params={"api-key": HELIUS_API_KEY},
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=8),
+            ) as r:
+                r.raise_for_status()
+                logger.info("Helius webhook → watching pump.fun program ✅")
     except Exception as e:
         logger.error(f"Helius webhook setup error: {e}")
 
