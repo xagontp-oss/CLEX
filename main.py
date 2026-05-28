@@ -453,7 +453,7 @@ async def fire_alert(entry: WatchlistEntry, momentum: Dict):
     txn = momentum.get("tx_count", 0)
 
     text = (
-        f"😈 *CLEX CALLOUT*\n\n"
+        f"😈 *𝐂𝐋𝐄𝐗 𝐂𝐀𝐋𝐋𝐎𝐔𝐓*\n\n"
         f"🪙 *{name}* (${symbol})\n"
         f"`{mint}`\n\n"
         f"⏱ *{age_str} old* — caught rising\n\n"
@@ -552,7 +552,7 @@ async def start(m: Message):
          InlineKeyboardButton(text="ℹ️ How it works", callback_data="help")],
     ])
     await m.answer(
-        "😈 *CLEX Pump.fun Scanner*\n\n"
+        "😈 *𝕎𝕖𝕝𝕔𝕠𝕞𝕖 𝕥𝕠 ℂ𝕃𝔼𝕏, 𝕙𝕦𝕞𝕒𝕟.*\n\n"
         "Every new launch enters a watchlist.\n"
         "Alerts only fire when momentum is *proven* — rising curve, growing holders, sustained buying.\n\n"
         "No spam. Only callouts worth trading.",
@@ -604,7 +604,7 @@ async def help_cb(q: CallbackQuery):
         "• Top wallet concentration (must be <50%)\n"
         "• Continuity (two consecutive growing windows)\n\n"
         "Coins that don't prove themselves within 5 min are dropped silently.\n"
-        "Max 5 alerts/hour · 3 min gap between alerts.",
+        "CELX gives you the early position,includes risks.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="⬅️ Back", callback_data="back")]
         ]),
