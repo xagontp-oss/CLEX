@@ -180,8 +180,11 @@ async def helius_set_pump_watch():
 # ── RPC ───────────────────────────────────────────────────────────────────────
 async def rpc(method: str, params: list, timeout: int = 6) -> Optional[Dict]:
     try:
+        qn  = os.getenv("QUICKNODE_RPC", "")
+        hel = os.getenv("HELIUS_API_KEY", "")
+        url = qn or (f"https://mainnet.helius-rpc.com/?api-key={hel}" if hel else "https://api.mainnet-beta.solana.com")
         async with aiohttp.ClientSession() as s:
-            async with s.post(HELIUS_RPC,
+            async with s.post(url,
                 json={"jsonrpc":"2.0","id":1,"method":method,"params":params},
                 timeout=aiohttp.ClientTimeout(total=timeout)) as r:
                 if r.status == 200:
@@ -192,8 +195,11 @@ async def rpc(method: str, params: list, timeout: int = 6) -> Optional[Dict]:
 
 async def das(method: str, params: dict, timeout: int = 6) -> Optional[Dict]:
     try:
+        # DAS methods only work on Helius — fall back gracefully if unavailable
+        hel = os.getenv("HELIUS_API_KEY", "")
+        url = f"https://mainnet.helius-rpc.com/?api-key={hel}" if hel else os.getenv("QUICKNODE_RPC", "https://api.mainnet-beta.solana.com")
         async with aiohttp.ClientSession() as s:
-            async with s.post(HELIUS_RPC,
+            async with s.post(url,
                 json={"jsonrpc":"2.0","id":1,"method":method,"params":params},
                 timeout=aiohttp.ClientTimeout(total=timeout)) as r:
                 if r.status == 200:
