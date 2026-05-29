@@ -56,7 +56,11 @@ PUMP_PROGRAM = "6EF8rQNi1oDEZ7zrKsCauKMorruBaGECQw6B469Z7z8"
 WSOL_MINT    = "So11111111111111111111111111111111111111112"
 TOTAL_SUPPLY = 1_000_000_000
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+# ── LOGGING — only keep important events, suppress noise ──────────────────────
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
 logger = logging.getLogger(__name__)
 
 bot    = Bot(token=TELEGRAM_TOKEN)
@@ -415,7 +419,6 @@ async def fire_alert(entry: WatchlistEntry, momentum: Dict):
         f"Socials: {social_line}"
     )
 
-    # Send callout to all subscribers
     subscribers = await get_subscribers()
     for chat_id in subscribers:
         try:
@@ -424,12 +427,8 @@ async def fire_alert(entry: WatchlistEntry, momentum: Dict):
         except TelegramAPIError as e:
             logger.error(f"Send error to {chat_id}: {e}")
 
-    # Extract top holder addresses from latest snapshot for blacklist check
     top_holders = []
-    if entry.snapshots:
-        pass  # holder addresses not in snapshot — blacklist check uses mint scan
 
-    # Trigger per-user snipers
     snipers = await get_enabled_snipers()
     for su in snipers:
         uid = su["user_id"]
@@ -446,7 +445,8 @@ async def _run_user_snipe(user_id: int, mint: str, name: str,
     ok, sig, method, buy_sol, exit_mode = await execute_user_buy(
         user_id, mint, name, symbol, momentum, top_holders)
     if ok:
-        mode_label = {"momentum":"🔥 Momentum exits","steady":"📈 Trailing stop","weak":"💤 Fixed TP/SL"}.get(exit_mode, exit_mode)
+        mode_label = {"momentum":"🔥 Momentum exits","steady":"📈 Trailing stop",
+                      "weak":"💤 Fixed TP/SL"}.get(exit_mode, exit_mode)
         msg = (
             f"✅ *Sniped via {method}*\n"
             f"*{name}* (${symbol})\n"
@@ -487,15 +487,12 @@ async def process_payload(payload: list):
             fetch_token_metadata(mint),
             fetch_dev_history(dev_wallet),
             __import__('sniper').fingerprint_dev_wallet(dev_wallet))
-        # Append fingerprint flag if single-funder detected
         rug_risk, risk_flags = pre_filter_rug(meta, dev)
         if fp.get('single_funder'):
             rug_risk = min(rug_risk + 20, 100)
             risk_flags.append(fp['flag'])
         if rug_risk >= 85:
             logger.debug(f"Instant discard {mint[:20]}: rug={rug_risk}"); continue
-        # Record first-slot buyers for blacklist tracking
-        create_slot = tx.get('slot', 0)
         for sig_acct in tx.get('accountData', []):
             acct_addr = sig_acct.get('account', '')
             if acct_addr and acct_addr != dev_wallet:
@@ -506,7 +503,7 @@ async def process_payload(payload: list):
             added_at=time.time(), meta=meta, dev=dev,
             rug_risk=rug_risk, risk_flags=risk_flags)
         watchlist[mint] = entry
-        logger.info(f"Watchlist +{meta.get('name','?')} ({mint[:20]}) rug={rug_risk} watching...")
+        logger.debug(f"Watchlist +{meta.get('name','?')} ({mint[:20]}) rug={rug_risk}")
 
 # ── KEYBOARDS ─────────────────────────────────────────────────────────────────
 def main_kb(subscribed: bool) -> InlineKeyboardMarkup:
@@ -556,8 +553,7 @@ async def start(m: Message):
         "Alerts only fire when momentum is *proven* — rising curve, growing holders, sustained buying.\n\n"
         "No spam. Only callouts worth trading.",
         reply_markup=main_kb(subscribed),
-        parse_mode=ParseMode.MARKDOWN
-    )
+        parse_mode=ParseMode.MARKDOWN)
 
 @router.callback_query(F.data == "sub")
 async def subscribe(q: CallbackQuery):
@@ -571,9 +567,8 @@ async def subscribe(q: CallbackQuery):
 async def unsubscribe(q: CallbackQuery):
     await remove_subscriber(q.from_user.id)
     await q.answer("🔕 Unsubscribed")
-    await q.message.edit_text(
-        "🔕 Unsubscribed. Use /start to resubscribe.",
-        reply_markup=main_kb(False))
+    await q.message.edit_text("🔕 Unsubscribed. Use /start to resubscribe.",
+                               reply_markup=main_kb(False))
 
 @router.callback_query(F.data == "back")
 async def back(q: CallbackQuery):
@@ -630,7 +625,7 @@ async def performance_cmd(m: Message):
         return
     recent_lines = []
     for r in stats.get("recent", []):
-        sign = "+" if r["pnl"] >= 0 else ""
+        sign  = "+" if r["pnl"] >= 0 else ""
         emoji = "🟢" if r["pnl"] >= 0 else "🔴"
         recent_lines.append(
             f"{emoji} {r['name']} (${r['symbol']}) "
@@ -642,49 +637,45 @@ async def performance_cmd(m: Message):
         f"Total PnL: {'+' if stats['total_pnl']>=0 else ''}{stats['total_pnl']:.4f} SOL\n"
         f"Avg win: +{stats['avg_win_pct']:.1f}% · Avg loss: {stats['avg_loss_pct']:.1f}%\n"
         f"Avg hold: {stats['avg_hold_mins']}min\n\n"
-        f"🏆 Best: {stats['best']['name']} +{stats['best']['pnl']:.4f} SOL (+{stats['best']['pct']:.1f}%)\n"
-        f"💀 Worst: {stats['worst']['name']} {stats['worst']['pnl']:.4f} SOL ({stats['worst']['pct']:.1f}%)\n\n"
+        f"🏆 Best: {stats['best']['name']} +{stats['best']['pnl']:.4f} SOL\n"
+        f"💀 Worst: {stats['worst']['name']} {stats['worst']['pnl']:.4f} SOL\n\n"
         f"*Last 5 trades:*\n{recent_block}",
         parse_mode=ParseMode.MARKDOWN)
+
+user_sell_pending: Dict[int, int] = {}
 
 @router.message(Command("sell"))
 async def sell_cmd(m: Message):
     uid       = m.from_user.id
     positions = await get_open_positions(uid)
     if not positions:
-        await m.answer("No open positions to sell.")
-        return
+        await m.answer("No open positions to sell."); return
     if len(positions) == 1:
-        pos = positions[0]
-        val = await __import__("sniper").get_position_value_sol(pos["mint"], pos["token_amount"])
+        pos     = positions[0]
+        val     = await sn.get_position_value_sol(pos["mint"], pos["token_amount"])
         pnl_pct = round((val / pos["sol_spent"] - 1) * 100, 1) if pos["sol_spent"] else 0
-        sign = "+" if pnl_pct >= 0 else ""
+        sign    = "+" if pnl_pct >= 0 else ""
         await m.answer(
             f"🔫 *Manual Sell*\n\n"
             f"*{pos['name']}* (${pos['symbol']})\n"
             f"Current value: {val:.4f} SOL ({sign}{pnl_pct:.1f}%)\n\n"
             f"Reply /sellconfirm to exit now.",
             parse_mode=ParseMode.MARKDOWN)
-        # Store pending sell in user state
         user_sell_pending[uid] = pos["id"]
     else:
-        lines = []
-        for i, pos in enumerate(positions):
-            lines.append(f"{i+1}. *{pos['name']}* (${pos['symbol']}) — {pos['sol_spent']} SOL")
+        lines = [f"{i+1}. *{p['name']}* (${p['symbol']}) — {p['sol_spent']} SOL"
+                 for i, p in enumerate(positions)]
         await m.answer(
-            f"Open positions:\n\n" + "\n".join(lines) +
+            "Open positions:\n\n" + "\n".join(lines) +
             "\n\nReply /sell <number> to select one.",
             parse_mode=ParseMode.MARKDOWN)
-
-user_sell_pending: Dict[int, int] = {}
 
 @router.message(Command("sellconfirm"))
 async def sellconfirm_cmd(m: Message):
     uid    = m.from_user.id
     pos_id = user_sell_pending.pop(uid, None)
     if not pos_id:
-        await m.answer("No pending sell. Use /sell first.")
-        return
+        await m.answer("No pending sell. Use /sell first."); return
     await m.answer("⏳ Executing sell...")
     ok, sig, pnl_sol, pnl_pct = await execute_manual_sell(uid, pos_id)
     if ok:
@@ -745,7 +736,7 @@ async def sniper_menu(q: CallbackQuery):
             reply_markup=sniper_menu_kb(user),
             parse_mode=ParseMode.MARKDOWN)
 
-# ── SNIPER SETUP FLOW ─────────────────────────────────────────────────────────
+# ── SNIPER SETUP ──────────────────────────────────────────────────────────────
 @router.callback_query(F.data == "sniper_setup")
 async def sniper_setup_start(q: CallbackQuery):
     await q.answer()
@@ -792,15 +783,11 @@ async def handle_message(m: Message):
     state = await get_setup_state(uid)
     if not state or state["step"] != "key":
         return
-
     raw_key = (m.text or "").strip()
-
-    # Delete immediately for security
     try:
         await bot.delete_message(m.chat.id, m.message_id)
     except:
         pass
-
     valid, pubkey, err = validate_private_key(raw_key)
     if not valid:
         await bot.send_message(uid,
@@ -808,14 +795,11 @@ async def handle_message(m: Message):
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="❌ Cancel", callback_data="sniper_cancel")]]))
         return
-
     risk    = state["risk"]
     profile = RISK_PROFILES[risk]
     bal     = await get_sol_balance(pubkey)
-
     await save_sniper_user(uid, raw_key, pubkey, risk)
     await clear_setup_state(uid)
-
     await bot.send_message(uid,
         f"✅ *Wallet connected!*\n\n"
         f"Address: `{pubkey[:20]}...`\n"
@@ -876,8 +860,9 @@ async def show_positions(q: CallbackQuery):
     lines = []
     now = time.time()
     for pos in positions:
-        age = int((now - pos["bought_at"]) / 60)
-        mode_label = {"momentum":"🔥","steady":"📈","weak":"💤"}.get(pos.get('exit_mode','?'),'?')
+        age        = int((now - pos["bought_at"]) / 60)
+        mode_label = {"momentum":"🔥","steady":"📈","weak":"💤"}.get(
+            pos.get("exit_mode","?"), "?")
         lines.append(
             f"• *{pos['name']}* (${pos['symbol']})\n"
             f"  {pos['sol_spent']} SOL · {age}m ago · mode:{mode_label}")
@@ -938,7 +923,7 @@ app = FastAPI(lifespan=lifespan)
 @app.post("/webhook")
 async def webhook(req: Request):
     payload = await req.json()
-    logger.info(f"Webhook: {len(payload)} txns")
+    logger.debug(f"Webhook: {len(payload)} txns")
     asyncio.create_task(process_payload(payload))
     return {"ok": True}
 
