@@ -2,7 +2,7 @@
 CLEX Sniper Module v3 — dynamic sizing, intelligent exit engine, live PnL,
 rug detection, wallet fingerprinting, first-buyer blacklist, graduated token
 detection, partial sell command, cross-position risk cap, performance tracker,
-custom trade amount per user.
+custom trade amount per user. QuickNode RPC support.
 """
 import asyncio
 import aiosqlite
@@ -24,10 +24,15 @@ HELIUS_API_KEY = os.getenv("HELIUS_API_KEY", "")
 MASTER_KEY     = os.getenv("MASTER_ENCRYPTION_KEY", "")
 DB_PATH        = "clex.db"
 
-RPC_ENDPOINTS = [
-    f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}",
-    "https://api.mainnet-beta.solana.com",
-]
+def _rpc_url() -> str:
+    """Returns the best available RPC endpoint at call time."""
+    qn  = os.getenv("QUICKNODE_RPC", "")
+    hel = os.getenv("HELIUS_API_KEY", "")
+    if qn:
+        return qn
+    if hel:
+        return f"https://mainnet.helius-rpc.com/?api-key={hel}"
+    return "https://api.mainnet-beta.solana.com"
 
 PUMPPORTAL_URL  = "https://pumpportal.fun/api/trade-local"
 JUPITER_QUOTE   = "https://quote-api.jup.ag/v6/quote"
@@ -46,7 +51,7 @@ RISK_PROFILES = {
     "low": {
         "label":             "🛡 Low Risk",
         "buy_pct":           0.05,
-        "min_buy":           0.02,
+        "min_buy":           0.001,
         "max_buy":           0.10,
         "slippage":          10,
         "priority_fee":      0.001,
@@ -63,7 +68,7 @@ RISK_PROFILES = {
     "moderate": {
         "label":             "⚡ Moderate",
         "buy_pct":           0.10,
-        "min_buy":           0.05,
+        "min_buy":           0.001,
         "max_buy":           0.25,
         "slippage":          15,
         "priority_fee":      0.003,
@@ -80,7 +85,7 @@ RISK_PROFILES = {
     "psycho": {
         "label":             "🤑 Psycho",
         "buy_pct":           0.20,
-        "min_buy":           0.10,
+        "min_buy":           0.001,
         "max_buy":           0.50,
         "slippage":          25,
         "priority_fee":      0.005,
@@ -110,18 +115,13 @@ def classify_exit_mode(momentum: Dict) -> str:
 # ── DYNAMIC BUY SIZE ──────────────────────────────────────────────────────────
 def calc_buy_size(balance: float, profile: Dict,
                   custom_amount: Optional[float] = None) -> float:
-    """
-    If custom_amount is set, use it directly (capped to usable balance).
-    Otherwise use profile buy_pct of balance.
-    """
-    fee     = profile["priority_fee"]
-    usable  = balance - fee - 0.005
+    fee    = profile["priority_fee"]
+    usable = balance - fee - 0.005
     if usable <= 0:
         return 0.0
     if custom_amount and custom_amount > 0:
         return round(min(custom_amount, usable), 4)
     raw = balance * profile["buy_pct"]
-    raw = max(raw, profile["min_buy"])
     raw = min(raw, profile["max_buy"])
     return round(min(raw, usable), 4)
 
@@ -200,19 +200,11 @@ async def init_sniper_db():
                 hold_secs       REAL NOT NULL,
                 closed_at       REAL NOT NULL
             )""")
-        # safe migrations
         for col, defn in [
-            ("exit_mode",      "TEXT DEFAULT 'steady'"),
-            ("peak_value_sol", "REAL DEFAULT NULL"),
-            ("trailing_stop",  "REAL DEFAULT NULL"),
-            ("tier1_sold",     "INTEGER DEFAULT 0"),
-            ("tier2_sold",     "INTEGER DEFAULT 0"),
-            ("last_update_at", "REAL DEFAULT NULL"),
-            ("custom_amount",  "REAL DEFAULT NULL"),
+            ("custom_amount", "REAL DEFAULT NULL"),
         ]:
             try:
-                await db.execute(
-                    f"ALTER TABLE sniper_users ADD COLUMN {col} {defn}")
+                await db.execute(f"ALTER TABLE sniper_users ADD COLUMN {col} {defn}")
             except: pass
         for col, defn in [
             ("exit_mode",      "TEXT DEFAULT 'steady'"),
@@ -223,8 +215,7 @@ async def init_sniper_db():
             ("last_update_at", "REAL DEFAULT NULL"),
         ]:
             try:
-                await db.execute(
-                    f"ALTER TABLE sniper_positions ADD COLUMN {col} {defn}")
+                await db.execute(f"ALTER TABLE sniper_positions ADD COLUMN {col} {defn}")
             except: pass
         await db.commit()
 
@@ -418,8 +409,7 @@ async def close_position(pos_id: int, status: str, sell_tx: str,
                          pnl_sol: float, pnl_pct: float):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "UPDATE sniper_positions "
-            "SET status=?,sell_tx=?,pnl_sol=?,pnl_pct=? WHERE id=?",
+            "UPDATE sniper_positions SET status=?,sell_tx=?,pnl_sol=?,pnl_pct=? WHERE id=?",
             (status, sell_tx, pnl_sol, pnl_pct, pos_id))
         await db.commit()
 
@@ -483,23 +473,21 @@ def load_keypair(encrypted_key: str):
 
 async def get_sol_balance(pubkey: str) -> float:
     try:
-        rpc_url = f"https://mainnet.helius-rpc.com/?api-key={os.getenv('HELIUS_API_KEY','')}"
         async with aiohttp.ClientSession() as s:
-            async with s.post(rpc_url,
+            async with s.post(_rpc_url(),
                 json={"jsonrpc":"2.0","id":1,"method":"getBalance","params":[pubkey]},
-                timeout=aiohttp.ClientTimeout(total=5)) as r:
+                timeout=aiohttp.ClientTimeout(total=8)) as r:
                 data = await r.json()
                 return round(data.get("result",{}).get("value",0)/1e9, 4)
     except: return 0.0
 
 async def get_token_balance(pubkey: str, mint: str) -> float:
     try:
-        rpc_url = f"https://mainnet.helius-rpc.com/?api-key={os.getenv('HELIUS_API_KEY','')}"
         async with aiohttp.ClientSession() as s:
-            async with s.post(rpc_url,
+            async with s.post(_rpc_url(),
                 json={"jsonrpc":"2.0","id":1,"method":"getTokenAccountsByOwner",
                       "params":[pubkey,{"mint":mint},{"encoding":"jsonParsed"}]},
-                timeout=aiohttp.ClientTimeout(total=5)) as r:
+                timeout=aiohttp.ClientTimeout(total=8)) as r:
                 data  = await r.json()
                 accts = data.get("result",{}).get("value",[])
                 if accts:
@@ -570,9 +558,8 @@ async def is_graduated(mint: str) -> bool:
 # ── RPC ───────────────────────────────────────────────────────────────────────
 async def _rpc(method: str, params: list) -> Optional[Dict]:
     try:
-        rpc_url = f"https://mainnet.helius-rpc.com/?api-key={os.getenv('HELIUS_API_KEY','')}"
         async with aiohttp.ClientSession() as s:
-            async with s.post(rpc_url,
+            async with s.post(_rpc_url(),
                 json={"jsonrpc":"2.0","id":1,"method":method,"params":params},
                 timeout=aiohttp.ClientTimeout(total=8)) as r:
                 if r.status == 200:
@@ -599,9 +586,9 @@ async def send_transaction_fast(tx_bytes: bytes, keypair,
     tx     = VersionedTransaction.from_bytes(tx_bytes)
     signed = VersionedTransaction(tx.message, [keypair])
     tx_b64 = base64.b64encode(bytes(signed)).decode()
-    rpc_url = f"https://mainnet.helius-rpc.com/?api-key={os.getenv('HELIUS_API_KEY','')}"
-    endpoints = [rpc_url, "https://api.mainnet-beta.solana.com"]
-    results = await asyncio.gather(
+    # race across Quicknode + public RPC
+    endpoints = [_rpc_url(), "https://api.mainnet-beta.solana.com"]
+    results   = await asyncio.gather(
         *[_send_to_rpc(u, tx_b64, skip) for u in endpoints],
         return_exceptions=True)
     for r in results:
@@ -610,11 +597,10 @@ async def send_transaction_fast(tx_bytes: bytes, keypair,
 
 async def confirm_transaction(sig: str, timeout_s: int = 25) -> bool:
     deadline = time.time() + timeout_s
-    rpc_url  = f"https://mainnet.helius-rpc.com/?api-key={os.getenv('HELIUS_API_KEY','')}"
     async with aiohttp.ClientSession() as s:
         while time.time() < deadline:
             try:
-                async with s.post(rpc_url,
+                async with s.post(_rpc_url(),
                     json={"jsonrpc":"2.0","id":1,"method":"getSignatureStatuses",
                           "params":[[sig],{"searchTransactionHistory":True}]},
                     timeout=aiohttp.ClientTimeout(total=4)) as r:
@@ -717,7 +703,6 @@ async def execute_user_buy(user_id: int, mint: str, name: str,
     if exposure >= max_exposure:
         return False, f"exposure cap hit ({exposure:.3f}/{max_exposure:.3f} SOL)", "none", 0, ""
 
-    # ── SIZING: custom amount or profile % ────────────────────────────────
     custom_amt = await get_custom_amount(user_id)
     buy_sol    = calc_buy_size(bal, profile, custom_amt)
 
@@ -725,7 +710,6 @@ async def execute_user_buy(user_id: int, mint: str, name: str,
         fee = profile["priority_fee"] + 0.005
         return False, f"balance too low for fees (have {bal:.4f} SOL, need >{fee:.3f} SOL)", "none", 0, ""
 
-    # Low balance warning — log it but don't block
     fee_needed = profile["priority_fee"] + 0.005
     if bal < buy_sol + fee_needed:
         logger.warning(f"User {user_id} low balance {bal:.4f} SOL for {buy_sol} SOL trade")
@@ -887,7 +871,6 @@ async def position_monitor_loop():
                 peak_ratio = peak / sol_spent
                 trail_stop = pos["trailing_stop"] or (sol_spent * (1 - profile["trailing_stop_pct"]))
 
-                # Hair trigger rug
                 prev_val = _prev_values.get(pos["id"], current_val)
                 if prev_val > 0:
                     drop_pct = (prev_val - current_val) / prev_val
