@@ -25,7 +25,8 @@ import sniper as sn
 from sniper import (
     RISK_PROFILES, init_sniper_db, get_sniper_user, save_sniper_user,
     delete_sniper_user, toggle_sniper, update_risk_profile,
-    get_enabled_snipers, execute_user_buy, get_open_positions,
+    get_enabled_snipers, execute_user_buy, execute_full_sell, execute_manual_sell,
+    get_open_positions, get_performance_stats, get_blacklist_count,
     get_sol_balance, validate_private_key, get_setup_state,
     set_setup_state, clear_setup_state, position_monitor_loop,
     set_alert_callback,
@@ -423,26 +424,35 @@ async def fire_alert(entry: WatchlistEntry, momentum: Dict):
         except TelegramAPIError as e:
             logger.error(f"Send error to {chat_id}: {e}")
 
+    # Extract top holder addresses from latest snapshot for blacklist check
+    top_holders = []
+    if entry.snapshots:
+        pass  # holder addresses not in snapshot — blacklist check uses mint scan
+
     # Trigger per-user snipers
     snipers = await get_enabled_snipers()
     for su in snipers:
         uid = su["user_id"]
         if not await is_subscriber(uid):
             continue
-        asyncio.create_task(_run_user_snipe(uid, mint, name, symbol, cp, su))
+        asyncio.create_task(_run_user_snipe(uid, mint, name, symbol, momentum, su, top_holders))
 
     logger.info(f"ALERT fired: {name} ({mint[:20]}) age={age_str} curve={cp}% vel={cv:.2f}%/min")
 
 async def _run_user_snipe(user_id: int, mint: str, name: str,
-                          symbol: str, entry_curve: float, su: Dict):
-    profile = RISK_PROFILES[su["risk_profile"]]
-    ok, sig, method = await execute_user_buy(user_id, mint, name, symbol, entry_curve)
+                          symbol: str, momentum: Dict, su: Dict,
+                          top_holders: list = None):
+    profile   = RISK_PROFILES[su["risk_profile"]]
+    ok, sig, method, buy_sol, exit_mode = await execute_user_buy(
+        user_id, mint, name, symbol, momentum, top_holders)
     if ok:
+        mode_label = {"momentum":"🔥 Momentum exits","steady":"📈 Trailing stop","weak":"💤 Fixed TP/SL"}.get(exit_mode, exit_mode)
         msg = (
             f"✅ *Sniped via {method}*\n"
             f"*{name}* (${symbol})\n"
-            f"{profile['buy_sol']} SOL · TP {profile['take_profit']}x · "
-            f"SL −{int((1-profile['stop_loss'])*100)}%\n"
+            f"Size: {buy_sol:.4f} SOL\n"
+            f"Strategy: {mode_label}\n"
+            f"Profile: {profile['label']}\n"
             f"`{sig[:20]}...`"
         )
     else:
@@ -473,11 +483,24 @@ async def process_payload(payload: list):
         mint, dev_wallet = result
         if mint in watchlist or await already_seen(mint): continue
         await mark_seen(mint)
-        meta, dev = await asyncio.gather(
-            fetch_token_metadata(mint), fetch_dev_history(dev_wallet))
+        meta, dev, fp = await asyncio.gather(
+            fetch_token_metadata(mint),
+            fetch_dev_history(dev_wallet),
+            __import__('sniper').fingerprint_dev_wallet(dev_wallet))
+        # Append fingerprint flag if single-funder detected
         rug_risk, risk_flags = pre_filter_rug(meta, dev)
+        if fp.get('single_funder'):
+            rug_risk = min(rug_risk + 20, 100)
+            risk_flags.append(fp['flag'])
         if rug_risk >= 85:
             logger.debug(f"Instant discard {mint[:20]}: rug={rug_risk}"); continue
+        # Record first-slot buyers for blacklist tracking
+        create_slot = tx.get('slot', 0)
+        for sig_acct in tx.get('accountData', []):
+            acct_addr = sig_acct.get('account', '')
+            if acct_addr and acct_addr != dev_wallet:
+                asyncio.create_task(
+                    __import__('sniper').record_first_buyer(acct_addr))
         entry = WatchlistEntry(
             mint=mint, dev_wallet=dev_wallet, tx_sig=tx.get("signature", ""),
             added_at=time.time(), meta=meta, dev=dev,
@@ -598,6 +621,83 @@ async def help_cb(q: CallbackQuery):
             [InlineKeyboardButton(text="⬅️ Back", callback_data="back")]]),
         parse_mode=ParseMode.MARKDOWN)
 
+@router.message(Command("performance"))
+async def performance_cmd(m: Message):
+    uid   = m.from_user.id
+    stats = await get_performance_stats(uid)
+    if not stats:
+        await m.answer("No closed trades yet. Stats will appear after your first exit.")
+        return
+    recent_lines = []
+    for r in stats.get("recent", []):
+        sign = "+" if r["pnl"] >= 0 else ""
+        emoji = "🟢" if r["pnl"] >= 0 else "🔴"
+        recent_lines.append(
+            f"{emoji} {r['name']} (${r['symbol']}) "
+            f"{sign}{r['pnl']:.4f} SOL ({sign}{r['pct']:.1f}%) [{r['reason']}]")
+    recent_block = "\n".join(recent_lines) or "None"
+    await m.answer(
+        f"📊 *CLEX Performance*\n\n"
+        f"Trades: {stats['total']} · Win rate: {stats['win_rate']}%\n"
+        f"Total PnL: {'+' if stats['total_pnl']>=0 else ''}{stats['total_pnl']:.4f} SOL\n"
+        f"Avg win: +{stats['avg_win_pct']:.1f}% · Avg loss: {stats['avg_loss_pct']:.1f}%\n"
+        f"Avg hold: {stats['avg_hold_mins']}min\n\n"
+        f"🏆 Best: {stats['best']['name']} +{stats['best']['pnl']:.4f} SOL (+{stats['best']['pct']:.1f}%)\n"
+        f"💀 Worst: {stats['worst']['name']} {stats['worst']['pnl']:.4f} SOL ({stats['worst']['pct']:.1f}%)\n\n"
+        f"*Last 5 trades:*\n{recent_block}",
+        parse_mode=ParseMode.MARKDOWN)
+
+@router.message(Command("sell"))
+async def sell_cmd(m: Message):
+    uid       = m.from_user.id
+    positions = await get_open_positions(uid)
+    if not positions:
+        await m.answer("No open positions to sell.")
+        return
+    if len(positions) == 1:
+        pos = positions[0]
+        val = await __import__("sniper").get_position_value_sol(pos["mint"], pos["token_amount"])
+        pnl_pct = round((val / pos["sol_spent"] - 1) * 100, 1) if pos["sol_spent"] else 0
+        sign = "+" if pnl_pct >= 0 else ""
+        await m.answer(
+            f"🔫 *Manual Sell*\n\n"
+            f"*{pos['name']}* (${pos['symbol']})\n"
+            f"Current value: {val:.4f} SOL ({sign}{pnl_pct:.1f}%)\n\n"
+            f"Reply /sellconfirm to exit now.",
+            parse_mode=ParseMode.MARKDOWN)
+        # Store pending sell in user state
+        from main import user_sell_pending
+        user_sell_pending[uid] = pos["id"]
+    else:
+        lines = []
+        for i, pos in enumerate(positions):
+            lines.append(f"{i+1}. *{pos['name']}* (${pos['symbol']}) — {pos['sol_spent']} SOL")
+        await m.answer(
+            f"Open positions:\n\n" + "\n".join(lines) +
+            "\n\nReply /sell <number> to select one.",
+            parse_mode=ParseMode.MARKDOWN)
+
+user_sell_pending: Dict[int, int] = {}
+
+@router.message(Command("sellconfirm"))
+async def sellconfirm_cmd(m: Message):
+    uid    = m.from_user.id
+    pos_id = user_sell_pending.pop(uid, None)
+    if not pos_id:
+        await m.answer("No pending sell. Use /sell first.")
+        return
+    await m.answer("⏳ Executing sell...")
+    ok, sig, pnl_sol, pnl_pct = await execute_manual_sell(uid, pos_id)
+    if ok:
+        sign = "+" if pnl_sol >= 0 else ""
+        await m.answer(
+            f"✅ *Sold!*\n"
+            f"PnL: {sign}{pnl_sol:.4f} SOL ({sign}{pnl_pct:.1f}%)\n"
+            f"`{sig[:20]}...`",
+            parse_mode=ParseMode.MARKDOWN)
+    else:
+        await m.answer(f"❌ Sell failed: {sig}")
+
 @router.message(Command("stats"))
 async def stats(m: Message):
     async with aiosqlite.connect(DB_PATH) as db:
@@ -612,7 +712,8 @@ async def stats(m: Message):
         f"Tokens scanned: {seen}\n"
         f"Active snipers: {snip}\n"
         f"Watchlist now: {len(watchlist)}\n"
-        f"Alerts last hour: {recent}/{MAX_ALERTS_PER_HOUR}",
+        f"Alerts last hour: {recent}/{MAX_ALERTS_PER_HOUR}\n"
+        f"Blacklisted wallets: {await get_blacklist_count()}",
         parse_mode=ParseMode.MARKDOWN)
 
 # ── SNIPER MENU ───────────────────────────────────────────────────────────────
