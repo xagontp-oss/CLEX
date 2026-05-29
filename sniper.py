@@ -456,8 +456,9 @@ def load_keypair(encrypted_key: str):
 
 async def get_sol_balance(pubkey: str) -> float:
     try:
+        rpc_url = f"https://mainnet.helius-rpc.com/?api-key={os.getenv('HELIUS_API_KEY','')}"
         async with aiohttp.ClientSession() as s:
-            async with s.post(HELIUS_RPC,
+            async with s.post(rpc_url,
                 json={"jsonrpc":"2.0","id":1,"method":"getBalance","params":[pubkey]},
                 timeout=aiohttp.ClientTimeout(total=5)) as r:
                 data = await r.json()
@@ -466,8 +467,9 @@ async def get_sol_balance(pubkey: str) -> float:
 
 async def get_token_balance(pubkey: str, mint: str) -> float:
     try:
+        rpc_url = f"https://mainnet.helius-rpc.com/?api-key={os.getenv('HELIUS_API_KEY','')}"
         async with aiohttp.ClientSession() as s:
-            async with s.post(HELIUS_RPC,
+            async with s.post(rpc_url,
                 json={"jsonrpc":"2.0","id":1,"method":"getTokenAccountsByOwner",
                       "params":[pubkey,{"mint":mint},{"encoding":"jsonParsed"}]},
                 timeout=aiohttp.ClientTimeout(total=5)) as r:
@@ -557,8 +559,9 @@ async def is_graduated(mint: str) -> bool:
 # ── TRANSACTION ENGINE ────────────────────────────────────────────────────────
 async def _rpc(method: str, params: list) -> Optional[Dict]:
     try:
+        rpc_url = f"https://mainnet.helius-rpc.com/?api-key={os.getenv('HELIUS_API_KEY','')}"
         async with aiohttp.ClientSession() as s:
-            async with s.post(HELIUS_RPC,
+            async with s.post(rpc_url,
                 json={"jsonrpc":"2.0","id":1,"method":method,"params":params},
                 timeout=aiohttp.ClientTimeout(total=8)) as r:
                 if r.status == 200:
@@ -594,10 +597,11 @@ async def send_transaction_fast(tx_bytes: bytes, keypair,
 
 async def confirm_transaction(sig: str, timeout_s: int = 25) -> bool:
     deadline = time.time() + timeout_s
+    rpc_url  = f"https://mainnet.helius-rpc.com/?api-key={os.getenv('HELIUS_API_KEY','')}"
     async with aiohttp.ClientSession() as s:
         while time.time() < deadline:
             try:
-                async with s.post(HELIUS_RPC,
+                async with s.post(rpc_url,
                     json={"jsonrpc":"2.0","id":1,"method":"getSignatureStatuses",
                           "params":[[sig],{"searchTransactionHistory":True}]},
                     timeout=aiohttp.ClientTimeout(total=4)) as r:
