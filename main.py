@@ -666,7 +666,6 @@ async def sell_cmd(m: Message):
             f"Reply /sellconfirm to exit now.",
             parse_mode=ParseMode.MARKDOWN)
         # Store pending sell in user state
-        from main import user_sell_pending
         user_sell_pending[uid] = pos["id"]
     else:
         lines = []
@@ -742,9 +741,7 @@ async def sniper_menu(q: CallbackQuery):
             f"Wallet: `{user['pubkey'][:20]}...`\n"
             f"Balance: {bal} SOL\n"
             f"Profile: {profile['label']}\n"
-            f"Buy: {profile['buy_sol']} SOL · "
-            f"TP {profile['take_profit']}x · "
-            f"SL −{int((1-profile['stop_loss'])*100)}%",
+            f"{profile['desc']}",
             reply_markup=sniper_menu_kb(user),
             parse_mode=ParseMode.MARKDOWN)
 
@@ -841,7 +838,7 @@ async def sniper_toggle(q: CallbackQuery):
     if new_state:
         profile = RISK_PROFILES[user["risk_profile"]]
         bal     = await get_sol_balance(user["pubkey"])
-        needed  = profile["buy_sol"] + profile["priority_fee"] + 0.01
+        needed  = profile["min_buy"] + profile["priority_fee"] + 0.01
         if bal < needed:
             await q.answer(
                 f"Insufficient balance! Need {needed:.3f} SOL, have {bal:.3f} SOL",
@@ -880,10 +877,10 @@ async def show_positions(q: CallbackQuery):
     now = time.time()
     for pos in positions:
         age = int((now - pos["bought_at"]) / 60)
+        mode_label = {"momentum":"🔥","steady":"📈","weak":"💤"}.get(pos.get('exit_mode','?'),'?')
         lines.append(
             f"• *{pos['name']}* (${pos['symbol']})\n"
-            f"  {pos['sol_spent']} SOL · {age}m ago · "
-            f"TP {pos['tp_target']}x · SL −{int((1-pos['sl_target'])*100)}%")
+            f"  {pos['sol_spent']} SOL · {age}m ago · mode:{mode_label}")
     await q.answer()
     await q.message.edit_text(
         f"📈 *Open Positions ({len(positions)})*\n\n" + "\n\n".join(lines),
