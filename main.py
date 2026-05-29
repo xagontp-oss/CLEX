@@ -37,7 +37,6 @@ TELEGRAM_TOKEN    = os.getenv("TELEGRAM_TOKEN")
 HELIUS_API_KEY    = os.getenv("HELIUS_API_KEY")
 HELIUS_WEBHOOK_ID = os.getenv("HELIUS_WEBHOOK_ID")
 HELIUS_BASE       = "https://api.helius.xyz/v0"
-HELIUS_RPC        = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
 DB_PATH           = "clex.db"
 WEBHOOK_SECRET    = os.getenv("WEBHOOK_SECRET", "change_this")
 
@@ -51,16 +50,20 @@ MIN_CURVE_VELOCITY  = 0.4
 MIN_HOLDERS         = 12
 MIN_HOLDER_DELTA    = 2
 MAX_TOP1_PCT        = 50
+MAX_LAUNCH_AGE_SECS = 120   # ignore CREATE txs older than 2 minutes
 
 PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 WSOL_MINT    = "So11111111111111111111111111111111111111112"
 TOTAL_SUPPLY = 1_000_000_000
 
+# ── LOGGING ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
 logger = logging.getLogger(__name__)
+# Silence uvicorn HTTP access logs — they flood Railway
+logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 
 bot    = Bot(token=TELEGRAM_TOKEN)
 dp     = Dispatcher()
@@ -119,6 +122,15 @@ async def init_db():
         await db.execute("""CREATE TABLE IF NOT EXISTS dev_cache (
             address TEXT PRIMARY KEY, data TEXT, cached_at REAL)""")
         await db.commit()
+    # Clear seen tokens on startup so fresh deploys don't skip recent launches
+    await clear_old_seen_tokens()
+
+async def clear_old_seen_tokens():
+    """Remove seen tokens older than 10 minutes so we don't miss fresh launches after redeploy."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "DELETE FROM seen_tokens WHERE alerted_at < datetime('now', '-10 minutes')")
+        await db.commit()
 
 async def get_subscribers() -> List[int]:
     async with aiosqlite.connect(DB_PATH) as db:
@@ -152,18 +164,20 @@ async def mark_seen(mint: str):
 
 # ── HELIUS SYNC ───────────────────────────────────────────────────────────────
 async def helius_set_pump_watch():
-    # Webhook addresses are configured manually in Helius dashboard.
-    # Skipping API sync to avoid consuming credits on startup.
-    logger.info("Helius webhook → using manually configured addresses ✅")
+    logger.info("Webhook → using Quicknode stream ✅")
 
 # ── RPC ───────────────────────────────────────────────────────────────────────
+def _rpc_url() -> str:
+    qn  = os.getenv("QUICKNODE_RPC", "")
+    hel = os.getenv("HELIUS_API_KEY", "")
+    if qn: return qn
+    if hel: return f"https://mainnet.helius-rpc.com/?api-key={hel}"
+    return "https://api.mainnet-beta.solana.com"
+
 async def rpc(method: str, params: list, timeout: int = 6) -> Optional[Dict]:
     try:
-        qn  = os.getenv("QUICKNODE_RPC", "")
-        hel = os.getenv("HELIUS_API_KEY", "")
-        url = qn or (f"https://mainnet.helius-rpc.com/?api-key={hel}" if hel else "https://api.mainnet-beta.solana.com")
         async with aiohttp.ClientSession() as s:
-            async with s.post(url,
+            async with s.post(_rpc_url(),
                 json={"jsonrpc":"2.0","id":1,"method":method,"params":params},
                 timeout=aiohttp.ClientTimeout(total=timeout)) as r:
                 if r.status == 200:
@@ -174,9 +188,8 @@ async def rpc(method: str, params: list, timeout: int = 6) -> Optional[Dict]:
 
 async def das(method: str, params: dict, timeout: int = 6) -> Optional[Dict]:
     try:
-        # DAS methods only work on Helius — fall back gracefully if unavailable
         hel = os.getenv("HELIUS_API_KEY", "")
-        url = f"https://mainnet.helius-rpc.com/?api-key={hel}" if hel else os.getenv("QUICKNODE_RPC", "https://api.mainnet-beta.solana.com")
+        url = f"https://mainnet.helius-rpc.com/?api-key={hel}" if hel else _rpc_url()
         async with aiohttp.ClientSession() as s:
             async with s.post(url,
                 json={"jsonrpc":"2.0","id":1,"method":method,"params":params},
@@ -189,20 +202,42 @@ async def das(method: str, params: dict, timeout: int = 6) -> Optional[Dict]:
 
 # ── DATA FETCHERS ─────────────────────────────────────────────────────────────
 async def fetch_token_metadata(mint: str) -> Dict:
+    """Fetch from pump.fun API first (free, no credits), fall back to DAS."""
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(
+                f"https://frontend-api.pump.fun/coins/{mint}",
+                timeout=aiohttp.ClientTimeout(total=5)) as r:
+                if r.status == 200:
+                    d = await r.json()
+                    return {
+                        "name":          d.get("name", ""),
+                        "symbol":        d.get("symbol", ""),
+                        "description":   d.get("description", ""),
+                        "uri":           d.get("image_uri", ""),
+                        "twitter":       d.get("twitter", ""),
+                        "telegram":      d.get("telegram", ""),
+                        "website":       d.get("website", ""),
+                        "usd_market_cap": d.get("usd_market_cap", 0),
+                        "market_cap_sol": d.get("market_cap", 0),
+                    }
+    except: pass
+    # Fall back to DAS if pump.fun API fails
     result = await das("getAsset", {"id": mint})
-    if not result:
-        return {}
+    if not result: return {}
     content  = result.get("content", {})
     metadata = content.get("metadata", {})
     links    = content.get("links", {})
     return {
-        "name":        metadata.get("name", ""),
-        "symbol":      metadata.get("symbol", ""),
-        "description": metadata.get("description", ""),
-        "uri":         content.get("json_uri", ""),
-        "twitter":     links.get("twitter", ""),
-        "telegram":    links.get("telegram", ""),
-        "website":     links.get("external_url", ""),
+        "name":          metadata.get("name", ""),
+        "symbol":        metadata.get("symbol", ""),
+        "description":   metadata.get("description", ""),
+        "uri":           content.get("json_uri", ""),
+        "twitter":       links.get("twitter", ""),
+        "telegram":      links.get("telegram", ""),
+        "website":       links.get("external_url", ""),
+        "usd_market_cap": 0,
+        "market_cap_sol": 0,
     }
 
 async def fetch_dev_history(dev_wallet: str) -> Dict:
@@ -356,15 +391,30 @@ def _bar(v: float, max_v: float = 100) -> str:
     filled = round(min(v, max_v) / max_v * 10)
     return "█" * filled + "░" * (10 - filled)
 
+def _fmt_mc(usd: float) -> str:
+    if usd >= 1_000_000: return f"${usd/1_000_000:.2f}M"
+    if usd >= 1_000:     return f"${usd/1_000:.1f}K"
+    return f"${usd:.0f}"
+
 async def fire_alert(entry: WatchlistEntry, momentum: Dict):
     meta   = entry.meta
     dev    = entry.dev
-    name   = meta.get("name", "Unknown") or "Unknown"
-    symbol = meta.get("symbol", "???")   or "???"
+    name   = meta.get("name") or "Unknown"
+    symbol = meta.get("symbol") or "???"
     mint   = entry.mint
     sig    = entry.tx_sig
     age_s  = momentum.get("age_secs", 0)
     age_str = f"{age_s//60}m{age_s%60}s" if age_s >= 60 else f"{age_s}s"
+
+    # Refresh metadata from pump.fun to get latest MC
+    fresh_meta = await fetch_token_metadata(mint)
+    if fresh_meta.get("name"):
+        name   = fresh_meta["name"]
+        symbol = fresh_meta.get("symbol", symbol)
+        meta   = {**meta, **fresh_meta}
+
+    usd_mc = meta.get("usd_market_cap", 0) or 0
+    mc_str = _fmt_mc(usd_mc) if usd_mc > 0 else "—"
 
     socials = []
     if meta.get("twitter"):  socials.append(f"[Twitter]({meta['twitter']})")
@@ -383,14 +433,13 @@ async def fire_alert(entry: WatchlistEntry, momentum: Dict):
     text = (
         f"😈 *𝐂𝐋𝐄𝐗 𝐂𝐀𝐋𝐋𝐎𝐔𝐓*\n\n"
         f"🪙 *{name}* (${symbol})\n"
-        f"`{mint}`\n\n"
-        f"⏱ *{age_str} old* — caught rising\n\n"
+        f"`{mint}`\n"
+        f"💰 MC: *{mc_str}* · ⏱ *{age_str} old*\n\n"
         f"📈 *MOMENTUM*\n"
-        f"Curve:   {cp}%  {_bar(cp, 100)}  (+{momentum.get('curve_delta',0):.2f}% last window)\n"
+        f"Curve:    {cp:.1f}%  {_bar(cp, 100)}  (+{momentum.get('curve_delta',0):.2f}%)\n"
         f"Velocity: {cv:.2f}%/min  {_bar(cv, 3)}\n"
-        f"Holders: {hc}  (+{momentum.get('holder_delta',0)} last window)\n"
-        f"H-rate:  {hv:.1f}/min\n"
-        f"Top1:    {t1}%   Txns: {txn}\n\n"
+        f"Holders:  {hc}  (+{momentum.get('holder_delta',0)} last window)\n"
+        f"H-rate:   {hv:.1f}/min · Top1: {t1:.1f}% · Txns: {txn}\n\n"
         f"⚠️ *RISK* (score: {entry.rug_risk}/100)\n"
         f"{risk_block}\n\n"
         f"👨‍💻 *DEV* `{entry.dev_wallet[:20]}...`\n"
@@ -415,16 +464,15 @@ async def fire_alert(entry: WatchlistEntry, momentum: Dict):
     snipers = await get_enabled_snipers()
     for su in snipers:
         uid = su["user_id"]
-        if not await is_subscriber(uid):
-            continue
+        if not await is_subscriber(uid): continue
         asyncio.create_task(_run_user_snipe(uid, mint, name, symbol, momentum, su, top_holders))
 
-    logger.info(f"ALERT fired: {name} ({mint[:20]}) age={age_str} curve={cp}% vel={cv:.2f}%/min")
+    logger.info(f"ALERT fired: {name} ({mint[:20]}) MC={mc_str} age={age_str} curve={cp:.1f}% vel={cv:.2f}%/min")
 
 async def _run_user_snipe(user_id: int, mint: str, name: str,
                           symbol: str, momentum: Dict, su: Dict,
                           top_holders: list = None):
-    profile   = RISK_PROFILES[su["risk_profile"]]
+    profile = RISK_PROFILES[su["risk_profile"]]
     ok, sig, method, buy_sol, exit_mode = await execute_user_buy(
         user_id, mint, name, symbol, momentum, top_holders)
     if ok:
@@ -442,8 +490,7 @@ async def _run_user_snipe(user_id: int, mint: str, name: str,
         msg = f"❌ *Snipe failed:* {sig}"
     try:
         await bot.send_message(user_id, msg, parse_mode=ParseMode.MARKDOWN)
-    except:
-        pass
+    except: pass
 
 # ── CAPTURE ───────────────────────────────────────────────────────────────────
 def extract_pump_launch(tx: Dict) -> Optional[Tuple[str, str]]:
@@ -458,35 +505,50 @@ def extract_pump_launch(tx: Dict) -> Optional[Tuple[str, str]]:
         if mint.endswith("pump"): return mint, dev_wallet
     return None
 
+# Track when we last received a tx to detect stream gaps
+_last_tx_received: float = 0.0
+
 async def process_payload(payload: list):
+    global _last_tx_received
     if not isinstance(payload, list): return
+    _last_tx_received = time.time()
+
     for tx in payload:
         result = extract_pump_launch(tx)
         if not result: continue
         mint, dev_wallet = result
+
+        # Freshness gate — skip if the slot is too old
+        # Quicknode stream has ~20 slot latency (~10s), so anything
+        # delivered now should be genuinely fresh. We track entry time.
         if mint in watchlist or await already_seen(mint): continue
         await mark_seen(mint)
+
         meta, dev, fp = await asyncio.gather(
             fetch_token_metadata(mint),
             fetch_dev_history(dev_wallet),
             __import__('sniper').fingerprint_dev_wallet(dev_wallet))
+
         rug_risk, risk_flags = pre_filter_rug(meta, dev)
         if fp.get('single_funder'):
             rug_risk = min(rug_risk + 20, 100)
             risk_flags.append(fp['flag'])
         if rug_risk >= 85:
             logger.debug(f"Instant discard {mint[:20]}: rug={rug_risk}"); continue
+
         for sig_acct in tx.get('accountData', []):
             acct_addr = sig_acct.get('account', '')
             if acct_addr and acct_addr != dev_wallet:
                 asyncio.create_task(
                     __import__('sniper').record_first_buyer(acct_addr))
+
+        name = meta.get("name") or mint[:8]
         entry = WatchlistEntry(
             mint=mint, dev_wallet=dev_wallet, tx_sig=tx.get("signature", ""),
             added_at=time.time(), meta=meta, dev=dev,
             rug_risk=rug_risk, risk_flags=risk_flags)
         watchlist[mint] = entry
-        logger.debug(f"Watchlist +{meta.get('name','?')} ({mint[:20]}) rug={rug_risk}")
+        logger.info(f"Watchlist +{name} ({mint[:20]}) rug={rug_risk}")
 
 # ── KEYBOARDS ─────────────────────────────────────────────────────────────────
 def main_kb(subscribed: bool) -> InlineKeyboardMarkup:
@@ -518,17 +580,12 @@ def sniper_menu_kb(user: Optional[Dict]) -> InlineKeyboardMarkup:
 
 def risk_kb(prefix: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=RISK_PROFILES["low"]["label"],
-                              callback_data=f"{prefix}_low")],
-        [InlineKeyboardButton(text=RISK_PROFILES["moderate"]["label"],
-                              callback_data=f"{prefix}_moderate")],
-        [InlineKeyboardButton(text=RISK_PROFILES["psycho"]["label"],
-                              callback_data=f"{prefix}_psycho")],
+        [InlineKeyboardButton(text=RISK_PROFILES["low"]["label"],      callback_data=f"{prefix}_low")],
+        [InlineKeyboardButton(text=RISK_PROFILES["moderate"]["label"], callback_data=f"{prefix}_moderate")],
+        [InlineKeyboardButton(text=RISK_PROFILES["psycho"]["label"],   callback_data=f"{prefix}_psycho")],
         [InlineKeyboardButton(text="⬅️ Back", callback_data="sniper_menu")],
     ])
 
-# ── USER INPUT STATE ──────────────────────────────────────────────────────────
-# stores: "key" | "custom_amount"
 user_input_state: Dict[int, str] = {}
 user_sell_pending: Dict[int, int] = {}
 
@@ -541,8 +598,7 @@ async def start(m: Message):
         "Every new launch enters a watchlist.\n"
         "Alerts only fire when momentum is *proven* — rising curve, growing holders, sustained buying.\n\n"
         "No spam. Only callouts worth trading.",
-        reply_markup=main_kb(subscribed),
-        parse_mode=ParseMode.MARKDOWN)
+        reply_markup=main_kb(subscribed), parse_mode=ParseMode.MARKDOWN)
 
 @router.callback_query(F.data == "sub")
 async def subscribe(q: CallbackQuery):
@@ -567,8 +623,7 @@ async def back(q: CallbackQuery):
         "Every new launch enters a watchlist.\n"
         "Alerts only fire when momentum is *proven* — rising curve, growing holders, sustained buying.\n\n"
         "No spam. Only callouts worth trading.",
-        reply_markup=main_kb(subscribed),
-        parse_mode=ParseMode.MARKDOWN)
+        reply_markup=main_kb(subscribed), parse_mode=ParseMode.MARKDOWN)
 
 @router.callback_query(F.data == "wl")
 async def show_watchlist(q: CallbackQuery):
@@ -581,7 +636,8 @@ async def show_watchlist(q: CallbackQuery):
         snap    = entry.snapshots[-1] if entry.snapshots else None
         curve   = f"{snap.curve_pct:.1f}%" if snap else "..."
         holders = snap.holder_count if snap else "..."
-        lines.append(f"• {entry.meta.get('name','?')[:16]} | {age}s | curve:{curve} | h:{holders}")
+        name    = entry.meta.get("name") or mint[:8]
+        lines.append(f"• {name[:16]} | {age}s | curve:{curve} | h:{holders}")
     await q.answer()
     await q.message.edit_text(
         f"*Watchlist ({len(watchlist)} coins)*\n\n" + "\n".join(lines),
@@ -610,8 +666,7 @@ async def performance_cmd(m: Message):
     uid   = m.from_user.id
     stats = await get_performance_stats(uid)
     if not stats:
-        await m.answer("No closed trades yet. Stats will appear after your first exit.")
-        return
+        await m.answer("No closed trades yet. Stats will appear after your first exit."); return
     recent_lines = []
     for r in stats.get("recent", []):
         sign  = "+" if r["pnl"] >= 0 else ""
@@ -619,7 +674,6 @@ async def performance_cmd(m: Message):
         recent_lines.append(
             f"{emoji} {r['name']} (${r['symbol']}) "
             f"{sign}{r['pnl']:.4f} SOL ({sign}{r['pct']:.1f}%) [{r['reason']}]")
-    recent_block = "\n".join(recent_lines) or "None"
     await m.answer(
         f"📊 *CLEX Performance*\n\n"
         f"Trades: {stats['total']} · Win rate: {stats['win_rate']}%\n"
@@ -628,7 +682,7 @@ async def performance_cmd(m: Message):
         f"Avg hold: {stats['avg_hold_mins']}min\n\n"
         f"🏆 Best: {stats['best']['name']} +{stats['best']['pnl']:.4f} SOL\n"
         f"💀 Worst: {stats['worst']['name']} {stats['worst']['pnl']:.4f} SOL\n\n"
-        f"*Last 5 trades:*\n{recent_block}",
+        f"*Last 5 trades:*\n" + "\n".join(recent_lines),
         parse_mode=ParseMode.MARKDOWN)
 
 @router.message(Command("sell"))
@@ -646,16 +700,14 @@ async def sell_cmd(m: Message):
             f"🔫 *Manual Sell*\n\n"
             f"*{pos['name']}* (${pos['symbol']})\n"
             f"Current value: {val:.4f} SOL ({sign}{pnl_pct:.1f}%)\n\n"
-            f"Reply /sellconfirm to exit now.",
-            parse_mode=ParseMode.MARKDOWN)
+            f"Reply /sellconfirm to exit now.", parse_mode=ParseMode.MARKDOWN)
         user_sell_pending[uid] = pos["id"]
     else:
         lines = [f"{i+1}. *{p['name']}* (${p['symbol']}) — {p['sol_spent']} SOL"
                  for i, p in enumerate(positions)]
-        await m.answer(
-            "Open positions:\n\n" + "\n".join(lines) +
-            "\n\nReply /sell <number> to select one.",
-            parse_mode=ParseMode.MARKDOWN)
+        await m.answer("Open positions:\n\n" + "\n".join(lines) +
+                       "\n\nReply /sell <number> to select one.",
+                       parse_mode=ParseMode.MARKDOWN)
 
 @router.message(Command("sellconfirm"))
 async def sellconfirm_cmd(m: Message):
@@ -668,9 +720,7 @@ async def sellconfirm_cmd(m: Message):
     if ok:
         sign = "+" if pnl_sol >= 0 else ""
         await m.answer(
-            f"✅ *Sold!*\n"
-            f"PnL: {sign}{pnl_sol:.4f} SOL ({sign}{pnl_pct:.1f}%)\n"
-            f"`{sig[:20]}...`",
+            f"✅ *Sold!*\nPnL: {sign}{pnl_sol:.4f} SOL ({sign}{pnl_pct:.1f}%)\n`{sig[:20]}...`",
             parse_mode=ParseMode.MARKDOWN)
     else:
         await m.answer(f"❌ Sell failed: {sig}")
@@ -708,15 +758,13 @@ async def sniper_menu(q: CallbackQuery):
             "Connect your own Solana wallet, choose a risk profile, toggle on/off anytime.\n\n"
             "⚠️ *Your key is encrypted with AES-256 and only you can delete it.*\n"
             "Use a dedicated wallet with only what you're willing to trade.",
-            reply_markup=sniper_menu_kb(None),
-            parse_mode=ParseMode.MARKDOWN)
+            reply_markup=sniper_menu_kb(None), parse_mode=ParseMode.MARKDOWN)
     else:
-        profile     = RISK_PROFILES[user["risk_profile"]]
-        status      = "🟢 ON" if user["sniper_enabled"] else "🔴 OFF"
-        bal         = await get_sol_balance(user["pubkey"])
-        custom_amt  = await get_custom_amount(uid)
+        profile    = RISK_PROFILES[user["risk_profile"]]
+        status     = "🟢 ON" if user["sniper_enabled"] else "🔴 OFF"
+        bal        = await get_sol_balance(user["pubkey"])
+        custom_amt = await get_custom_amount(uid)
         amount_line = f"Custom: {custom_amt} SOL per trade" if custom_amt else profile["desc"]
-        # Low balance warning
         fee_needed  = profile["priority_fee"] + 0.005
         warning     = "\n\n⚠️ *Balance very low — may not cover fees*" if bal < fee_needed else ""
         await q.message.edit_text(
@@ -725,10 +773,8 @@ async def sniper_menu(q: CallbackQuery):
             f"Balance: {bal} SOL\n"
             f"Profile: {profile['label']}\n"
             f"{amount_line}{warning}",
-            reply_markup=sniper_menu_kb(user),
-            parse_mode=ParseMode.MARKDOWN)
+            reply_markup=sniper_menu_kb(user), parse_mode=ParseMode.MARKDOWN)
 
-# ── SNIPER SETUP ──────────────────────────────────────────────────────────────
 @router.callback_query(F.data == "sniper_setup")
 async def sniper_setup_start(q: CallbackQuery):
     await q.answer()
@@ -740,8 +786,7 @@ async def sniper_setup_start(q: CallbackQuery):
         f"⚡ *Moderate* — {RISK_PROFILES['moderate']['desc']}\n\n"
         f"🤑 *Psycho* — {RISK_PROFILES['psycho']['desc']}\n\n"
         "You can change this anytime.",
-        reply_markup=risk_kb("setup_risk"),
-        parse_mode=ParseMode.MARKDOWN)
+        reply_markup=risk_kb("setup_risk"), parse_mode=ParseMode.MARKDOWN)
 
 @router.callback_query(F.data.startswith("setup_risk_"))
 async def sniper_setup_risk(q: CallbackQuery):
@@ -769,28 +814,25 @@ async def sniper_cancel(q: CallbackQuery):
     await q.answer("Cancelled")
     await sniper_menu(q)
 
-# ── CUSTOM AMOUNT ─────────────────────────────────────────────────────────────
 @router.callback_query(F.data == "sniper_custom_amount")
-async def sniper_custom_amount(q: CallbackQuery):
-    uid = q.from_user.id
+async def sniper_custom_amount_cb(q: CallbackQuery):
+    uid  = q.from_user.id
     user = await get_sniper_user(uid)
     if not user:
         await q.answer("Set up your sniper first"); return
-    custom = await get_custom_amount(uid)
+    custom  = await get_custom_amount(uid)
     profile = RISK_PROFILES[user["risk_profile"]]
-    current = f"{custom} SOL (custom)" if custom else f"{profile['buy_pct']*100:.0f}% of balance (profile default)"
+    current = f"{custom} SOL (custom)" if custom else f"{profile['buy_pct']*100:.0f}% of balance"
     user_input_state[uid] = "custom_amount"
     await q.answer()
     await q.message.edit_text(
-        f"💰 *Set Custom Trade Amount*\n\n"
-        f"Current: {current}\n\n"
-        f"Send the SOL amount you want per trade (e.g. `0.05`).\n"
-        f"Or tap *Use Profile Default* to go back to percentage-based sizing.\n\n"
-        f"⚠️ A warning will show if your balance is too low to cover fees.",
+        f"💰 *Set Custom Trade Amount*\n\nCurrent: {current}\n\n"
+        f"Send the SOL amount per trade (e.g. `0.05`).\n"
+        f"Or tap *Use Profile Default* to go back to % sizing.\n\n"
+        f"⚠️ Warning shown if balance too low to cover fees.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🔄 Use Profile Default", callback_data="sniper_clear_custom")],
-            [InlineKeyboardButton(text="❌ Cancel", callback_data="sniper_cancel")],
-        ]),
+            [InlineKeyboardButton(text="❌ Cancel", callback_data="sniper_cancel")]]),
         parse_mode=ParseMode.MARKDOWN)
 
 @router.callback_query(F.data == "sniper_clear_custom")
@@ -800,55 +842,41 @@ async def sniper_clear_custom(q: CallbackQuery):
     await q.answer("✅ Back to profile default")
     await sniper_menu(q)
 
-# ── MESSAGE HANDLER (private key + custom amount) ─────────────────────────────
 @router.message()
 async def handle_message(m: Message):
-    uid   = m.from_user.id
+    uid    = m.from_user.id
     istate = user_input_state.get(uid)
     state  = await get_setup_state(uid)
 
-    # ── Custom amount input ────────────────────────────────────────────────
     if istate == "custom_amount":
         raw = (m.text or "").strip()
         try:
             amount = float(raw)
-            if amount <= 0:
-                raise ValueError
+            if amount <= 0: raise ValueError
         except ValueError:
-            await m.answer("❌ Invalid amount. Send a number like `0.05`")
-            return
-
+            await m.answer("❌ Invalid. Send a number like `0.05`"); return
         user    = await get_sniper_user(uid)
         profile = RISK_PROFILES[user["risk_profile"]]
         bal     = await get_sol_balance(user["pubkey"])
         fee     = profile["priority_fee"] + 0.005
-
         warning = ""
         if amount + fee > bal:
             warning = (f"\n\n⚠️ *Low balance warning*\n"
-                       f"You have {bal:.4f} SOL. This trade + fees ({fee:.3f} SOL) "
-                       f"may exceed your balance. The trade will be skipped if funds are insufficient.")
-
+                       f"You have {bal:.4f} SOL. Trade + fees ({fee:.3f} SOL) "
+                       f"may exceed your balance.")
         await set_custom_amount(uid, amount)
         user_input_state.pop(uid, None)
         await m.answer(
-            f"✅ *Custom amount set: {amount} SOL per trade*{warning}\n\n"
-            f"Open the Sniper menu to turn it on.",
+            f"✅ *Custom amount set: {amount} SOL per trade*{warning}",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="🔫 Sniper Menu", callback_data="sniper_menu")]]))
         return
 
-    # ── Private key input ──────────────────────────────────────────────────
-    if not state or state["step"] != "key":
-        return
-
+    if not state or state["step"] != "key": return
     raw_key = (m.text or "").strip()
-    try:
-        await bot.delete_message(m.chat.id, m.message_id)
-    except:
-        pass
-
+    try: await bot.delete_message(m.chat.id, m.message_id)
+    except: pass
     valid, pubkey, err = validate_private_key(raw_key)
     if not valid:
         await bot.send_message(uid,
@@ -856,7 +884,6 @@ async def handle_message(m: Message):
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="❌ Cancel", callback_data="sniper_cancel")]]))
         return
-
     risk    = state["risk"]
     profile = RISK_PROFILES[risk]
     bal     = await get_sol_balance(pubkey)
@@ -866,14 +893,12 @@ async def handle_message(m: Message):
         f"✅ *Wallet connected!*\n\n"
         f"Address: `{pubkey[:20]}...`\n"
         f"Balance: {bal} SOL\n\n"
-        f"Profile: {profile['label']}\n"
-        f"{profile['desc']}\n\n"
-        f"Sniper is *OFF* by default — toggle it on from the Sniper menu when ready.",
+        f"Profile: {profile['label']}\n{profile['desc']}\n\n"
+        f"Sniper is *OFF* by default — toggle on from the Sniper menu.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🔫 Open Sniper Menu", callback_data="sniper_menu")]]),
         parse_mode=ParseMode.MARKDOWN)
 
-# ── SNIPER CONTROLS ───────────────────────────────────────────────────────────
 @router.callback_query(F.data == "sniper_toggle")
 async def sniper_toggle(q: CallbackQuery):
     uid  = q.from_user.id
@@ -893,8 +918,7 @@ async def sniper_change_risk(q: CallbackQuery):
         f"🛡 *Low Risk* — {RISK_PROFILES['low']['desc']}\n\n"
         f"⚡ *Moderate* — {RISK_PROFILES['moderate']['desc']}\n\n"
         f"🤑 *Psycho* — {RISK_PROFILES['psycho']['desc']}",
-        reply_markup=risk_kb("risk_select"),
-        parse_mode=ParseMode.MARKDOWN)
+        reply_markup=risk_kb("risk_select"), parse_mode=ParseMode.MARKDOWN)
 
 @router.callback_query(F.data.startswith("risk_select_"))
 async def risk_selected(q: CallbackQuery):
@@ -915,11 +939,9 @@ async def show_positions(q: CallbackQuery):
     now = time.time()
     for pos in positions:
         age        = int((now - pos["bought_at"]) / 60)
-        mode_label = {"momentum":"🔥","steady":"📈","weak":"💤"}.get(
-            pos.get("exit_mode","?"), "?")
-        lines.append(
-            f"• *{pos['name']}* (${pos['symbol']})\n"
-            f"  {pos['sol_spent']} SOL · {age}m ago · mode:{mode_label}")
+        mode_label = {"momentum":"🔥","steady":"📈","weak":"💤"}.get(pos.get("exit_mode","?"),"?")
+        lines.append(f"• *{pos['name']}* (${pos['symbol']})\n"
+                     f"  {pos['sol_spent']} SOL · {age}m ago · mode:{mode_label}")
     await q.answer()
     await q.message.edit_text(
         f"📈 *Open Positions ({len(positions)})*\n\n" + "\n\n".join(lines),
@@ -933,8 +955,7 @@ async def delete_confirm(q: CallbackQuery):
     await q.message.edit_text(
         "🗑 *Delete Wallet*\n\n"
         "This permanently removes your private key from CLEX.\n"
-        "Open positions will *not* be auto-sold.\n\n"
-        "Are you sure?",
+        "Open positions will *not* be auto-sold.\n\nAre you sure?",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="✅ Yes, Delete", callback_data="sniper_delete_go"),
              InlineKeyboardButton(text="❌ No, Keep",    callback_data="sniper_menu")]]),
@@ -945,7 +966,7 @@ async def delete_wallet(q: CallbackQuery):
     await delete_sniper_user(q.from_user.id)
     await q.answer("Wallet deleted")
     await q.message.edit_text(
-        "🗑 Wallet deleted. Your private key has been permanently removed from CLEX.\n\n"
+        "🗑 Wallet deleted. Your private key has been permanently removed.\n\n"
         "You can reconnect anytime from the Sniper menu.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="⬅️ Back", callback_data="back")]]))
@@ -959,7 +980,7 @@ async def lifespan(app: FastAPI):
     set_alert_callback(sniper_message_callback)
     await bot.delete_webhook(drop_pending_updates=True)
     await asyncio.sleep(3)
-    logger.info("DB ready · webhook synced")
+    logger.info("DB ready · Quicknode stream active")
     asyncio.create_task(watchlist_loop())
     asyncio.create_task(position_monitor_loop())
     poll = asyncio.create_task(dp.start_polling(
@@ -969,15 +990,13 @@ async def lifespan(app: FastAPI):
     poll.cancel()
     try:
         await asyncio.wait_for(bot.session.close(), timeout=5)
-    except:
-        pass
+    except: pass
 
 app = FastAPI(lifespan=lifespan)
 
 @app.post("/webhook")
 async def webhook(req: Request):
     payload = await req.json()
-    logger.debug(f"Webhook: {len(payload)} txns")
     asyncio.create_task(process_payload(payload))
     return {"ok": True}
 
@@ -986,4 +1005,4 @@ async def health():
     return {"status": "alive", "watchlist": len(watchlist)}
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8000, access_log=False)
