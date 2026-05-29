@@ -536,7 +536,7 @@ async def process_payload(payload: list):
         if rug_risk >= 85:
             logger.debug(f"Instant discard {mint[:20]}: rug={rug_risk}"); continue
 
-        for sig_acct in tx.get('accountData', []):
+        for sig_acct in list(tx.get('accountData', []))[:5]:
             acct_addr = sig_acct.get('account', '')
             if acct_addr and acct_addr != dev_wallet:
                 asyncio.create_task(
