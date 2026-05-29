@@ -318,15 +318,18 @@ async def clear_setup_state(user_id: int):
 # ── BLACKLIST ─────────────────────────────────────────────────────────────────
 async def record_first_buyer(wallet: str):
     now = time.time()
-    async with aiosqlite.connect(DB_PATH) as db:
+    try:
+      async with aiosqlite.connect(DB_PATH, timeout=10) as db:
         await db.execute("""
             INSERT INTO sniper_blacklist (wallet,snipe_count,first_seen,last_seen)
             VALUES (?,1,?,?)
             ON CONFLICT(wallet) DO UPDATE SET
                 snipe_count = snipe_count + 1,
                 last_seen   = excluded.last_seen
-        """, (wallet, now, now))
-        await db.commit()
+            """, (wallet, now, now))
+            await db.commit()
+    except Exception:
+        pass
 
 async def is_blacklisted(wallet: str) -> bool:
     async with aiosqlite.connect(DB_PATH) as db:
