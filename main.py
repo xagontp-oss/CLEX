@@ -152,30 +152,9 @@ async def mark_seen(mint: str):
 
 # ── HELIUS SYNC ───────────────────────────────────────────────────────────────
 async def helius_set_pump_watch():
-    if not HELIUS_WEBHOOK_ID:
-        logger.warning("HELIUS_WEBHOOK_ID not set")
-        return
-    try:
-        async with aiohttp.ClientSession() as s:
-            async with s.get(f"{HELIUS_BASE}/webhooks/{HELIUS_WEBHOOK_ID}",
-                params={"api-key": HELIUS_API_KEY},
-                timeout=aiohttp.ClientTimeout(total=8)) as r:
-                r.raise_for_status()
-                existing = await r.json()
-            payload = {
-                "webhookURL":       existing.get("webhookURL"),
-                "transactionTypes": existing.get("transactionTypes", ["Any"]),
-                "accountAddresses": [PUMP_PROGRAM],
-                "webhookType":      existing.get("webhookType", "enhanced"),
-                "authHeader":       existing.get("authHeader", WEBHOOK_SECRET),
-            }
-            async with s.put(f"{HELIUS_BASE}/webhooks/{HELIUS_WEBHOOK_ID}",
-                params={"api-key": HELIUS_API_KEY}, json=payload,
-                timeout=aiohttp.ClientTimeout(total=8)) as r:
-                r.raise_for_status()
-                logger.info("Helius webhook → watching pump.fun program ✅")
-    except Exception as e:
-        logger.error(f"Helius webhook setup error: {e}")
+    # Webhook addresses are configured manually in Helius dashboard.
+    # Skipping API sync to avoid consuming credits on startup.
+    logger.info("Helius webhook → using manually configured addresses ✅")
 
 # ── RPC ───────────────────────────────────────────────────────────────────────
 async def rpc(method: str, params: list, timeout: int = 6) -> Optional[Dict]:
