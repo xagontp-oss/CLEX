@@ -1,7 +1,8 @@
 """
 CLEX Sniper Module v3 — dynamic sizing, intelligent exit engine, live PnL,
 rug detection, wallet fingerprinting, first-buyer blacklist, graduated token
-detection, partial sell command, cross-position risk cap, performance tracker.
+detection, partial sell command, cross-position risk cap, performance tracker,
+custom trade amount per user.
 """
 import asyncio
 import aiosqlite
@@ -20,28 +21,25 @@ logger = logging.getLogger(__name__)
 
 # ── ENV ───────────────────────────────────────────────────────────────────────
 HELIUS_API_KEY = os.getenv("HELIUS_API_KEY", "")
-HELIUS_RPC     = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
 MASTER_KEY     = os.getenv("MASTER_ENCRYPTION_KEY", "")
 DB_PATH        = "clex.db"
 
 RPC_ENDPOINTS = [
-    HELIUS_RPC,
+    f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}",
     "https://api.mainnet-beta.solana.com",
 ]
 
 PUMPPORTAL_URL  = "https://pumpportal.fun/api/trade-local"
 JUPITER_QUOTE   = "https://quote-api.jup.ag/v6/quote"
 JUPITER_SWAP    = "https://quote-api.jup.ag/v6/swap"
-RAYDIUM_QUOTE   = "https://quote-api.raydium.io/v2/quote"
 WSOL_MINT       = "So11111111111111111111111111111111111111112"
-PUMP_GRADUATION = 85.0   # SOL raised at graduation
 
 POSITION_CHECK_INTERVAL = 15
 MIN_BUY_INTERVAL        = 30
 LIVE_UPDATE_INTERVAL    = 60
-RUG_DROP_THRESHOLD      = 0.15   # 15% single-window drop = emergency exit
-MAX_OPEN_EXPOSURE_PCT   = 0.30   # max 30% of wallet in open positions
-BLACKLIST_THRESHOLD     = 3      # snipes needed to blacklist a wallet
+RUG_DROP_THRESHOLD      = 0.15
+MAX_OPEN_EXPOSURE_PCT   = 0.30
+BLACKLIST_THRESHOLD     = 3
 
 # ── RISK PROFILES ─────────────────────────────────────────────────────────────
 RISK_PROFILES = {
@@ -110,12 +108,22 @@ def classify_exit_mode(momentum: Dict) -> str:
     return "weak"
 
 # ── DYNAMIC BUY SIZE ──────────────────────────────────────────────────────────
-def calc_buy_size(balance: float, profile: Dict) -> float:
-    raw    = balance * profile["buy_pct"]
-    raw    = max(raw, profile["min_buy"])
-    raw    = min(raw, profile["max_buy"])
-    usable = balance - profile["priority_fee"] - 0.01
-    return round(min(raw, max(usable, 0)), 4)
+def calc_buy_size(balance: float, profile: Dict,
+                  custom_amount: Optional[float] = None) -> float:
+    """
+    If custom_amount is set, use it directly (capped to usable balance).
+    Otherwise use profile buy_pct of balance.
+    """
+    fee     = profile["priority_fee"]
+    usable  = balance - fee - 0.005
+    if usable <= 0:
+        return 0.0
+    if custom_amount and custom_amount > 0:
+        return round(min(custom_amount, usable), 4)
+    raw = balance * profile["buy_pct"]
+    raw = max(raw, profile["min_buy"])
+    raw = min(raw, profile["max_buy"])
+    return round(min(raw, usable), 4)
 
 # ── ENCRYPTION ────────────────────────────────────────────────────────────────
 def _fernet():
@@ -138,7 +146,8 @@ async def init_sniper_db():
                 risk_profile    TEXT NOT NULL DEFAULT 'low',
                 sniper_enabled  INTEGER NOT NULL DEFAULT 0,
                 setup_at        REAL NOT NULL,
-                last_buy_at     REAL DEFAULT NULL
+                last_buy_at     REAL DEFAULT NULL,
+                custom_amount   REAL DEFAULT NULL
             )""")
         await db.execute("""
             CREATE TABLE IF NOT EXISTS sniper_positions (
@@ -168,7 +177,6 @@ async def init_sniper_db():
                 step            TEXT NOT NULL,
                 risk_profile    TEXT DEFAULT NULL
             )""")
-        # ── NEW: first-buyer blacklist ─────────────────────────────────────
         await db.execute("""
             CREATE TABLE IF NOT EXISTS sniper_blacklist (
                 wallet          TEXT PRIMARY KEY,
@@ -176,7 +184,6 @@ async def init_sniper_db():
                 first_seen      REAL NOT NULL,
                 last_seen       REAL NOT NULL
             )""")
-        # ── NEW: performance tracker ───────────────────────────────────────
         await db.execute("""
             CREATE TABLE IF NOT EXISTS sniper_performance (
                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -193,7 +200,20 @@ async def init_sniper_db():
                 hold_secs       REAL NOT NULL,
                 closed_at       REAL NOT NULL
             )""")
-        # migrate existing tables safely
+        # safe migrations
+        for col, defn in [
+            ("exit_mode",      "TEXT DEFAULT 'steady'"),
+            ("peak_value_sol", "REAL DEFAULT NULL"),
+            ("trailing_stop",  "REAL DEFAULT NULL"),
+            ("tier1_sold",     "INTEGER DEFAULT 0"),
+            ("tier2_sold",     "INTEGER DEFAULT 0"),
+            ("last_update_at", "REAL DEFAULT NULL"),
+            ("custom_amount",  "REAL DEFAULT NULL"),
+        ]:
+            try:
+                await db.execute(
+                    f"ALTER TABLE sniper_users ADD COLUMN {col} {defn}")
+            except: pass
         for col, defn in [
             ("exit_mode",      "TEXT DEFAULT 'steady'"),
             ("peak_value_sol", "REAL DEFAULT NULL"),
@@ -250,6 +270,19 @@ async def update_risk_profile(user_id: int, profile: str):
                          (profile, user_id))
         await db.commit()
 
+async def set_custom_amount(user_id: int, amount: Optional[float]):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE sniper_users SET custom_amount=? WHERE user_id=?",
+                         (amount, user_id))
+        await db.commit()
+
+async def get_custom_amount(user_id: int) -> Optional[float]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT custom_amount FROM sniper_users WHERE user_id=?", (user_id,))
+        row = await cur.fetchone()
+        return row[0] if row else None
+
 async def get_enabled_snipers() -> List[Dict]:
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
@@ -293,7 +326,6 @@ async def clear_setup_state(user_id: int):
 
 # ── BLACKLIST ─────────────────────────────────────────────────────────────────
 async def record_first_buyer(wallet: str):
-    """Log a wallet that bought in the same slot as CREATE."""
     now = time.time()
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
@@ -354,7 +386,6 @@ async def get_open_positions(user_id: Optional[int] = None) -> List[Dict]:
                 for r in rows]
 
 async def get_total_open_exposure(user_id: int) -> float:
-    """Total SOL currently committed in open positions for a user."""
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
             "SELECT SUM(sol_spent) FROM sniper_positions "
@@ -394,8 +425,7 @@ async def close_position(pos_id: int, status: str, sell_tx: str,
 
 # ── PERFORMANCE TRACKER ───────────────────────────────────────────────────────
 async def record_performance(pos: Dict, sol_received: float,
-                             pnl_sol: float, pnl_pct: float,
-                             exit_reason: str):
+                             pnl_sol: float, pnl_pct: float, exit_reason: str):
     hold_secs = time.time() - pos["bought_at"]
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
@@ -411,32 +441,29 @@ async def get_performance_stats(user_id: int) -> Dict:
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
             "SELECT pnl_sol,pnl_pct,exit_reason,hold_secs,name,symbol,closed_at "
-            "FROM sniper_performance WHERE user_id=? ORDER BY closed_at DESC",
-            (user_id,))
+            "FROM sniper_performance WHERE user_id=? ORDER BY closed_at DESC", (user_id,))
         rows = await cur.fetchall()
-    if not rows:
-        return {}
-    total      = len(rows)
-    wins       = [r for r in rows if r[0] > 0]
-    losses     = [r for r in rows if r[0] <= 0]
-    total_pnl  = sum(r[0] for r in rows)
-    avg_win    = sum(r[1] for r in wins) / len(wins) if wins else 0
-    avg_loss   = sum(r[1] for r in losses) / len(losses) if losses else 0
-    best       = max(rows, key=lambda r: r[0])
-    worst      = min(rows, key=lambda r: r[0])
-    avg_hold   = sum(r[3] for r in rows) / total
-    recent     = rows[:5]
+    if not rows: return {}
+    total     = len(rows)
+    wins      = [r for r in rows if r[0] > 0]
+    losses    = [r for r in rows if r[0] <= 0]
+    total_pnl = sum(r[0] for r in rows)
+    avg_win   = sum(r[1] for r in wins) / len(wins) if wins else 0
+    avg_loss  = sum(r[1] for r in losses) / len(losses) if losses else 0
+    best      = max(rows, key=lambda r: r[0])
+    worst     = min(rows, key=lambda r: r[0])
+    avg_hold  = sum(r[3] for r in rows) / total
     return {
         "total": total, "wins": len(wins), "losses": len(losses),
         "win_rate": round(len(wins)/total*100, 1),
         "total_pnl": round(total_pnl, 4),
         "avg_win_pct": round(avg_win, 1),
         "avg_loss_pct": round(avg_loss, 1),
-        "best": {"name":best[4],"symbol":best[5],"pnl":best[0],"pct":best[1]},
+        "best":  {"name":best[4],"symbol":best[5],"pnl":best[0],"pct":best[1]},
         "worst": {"name":worst[4],"symbol":worst[5],"pnl":worst[0],"pct":worst[1]},
         "avg_hold_mins": round(avg_hold/60, 1),
         "recent": [{"name":r[4],"symbol":r[5],"pnl":r[0],"pct":r[1],"reason":r[2]}
-                   for r in recent],
+                   for r in rows[:5]],
     }
 
 # ── WALLET UTILS ──────────────────────────────────────────────────────────────
@@ -481,41 +508,34 @@ async def get_token_balance(pubkey: str, mint: str) -> float:
     except: pass
     return 0.0
 
-# ── WALLET VOLUME FINGERPRINTING ──────────────────────────────────────────────
+# ── WALLET FINGERPRINTING ─────────────────────────────────────────────────────
 async def fingerprint_dev_wallet(dev_wallet: str) -> Dict:
-    """
-    Analyse 7-day SOL inflow pattern.
-    Flags wallets funded by a single source (rug wallet recycling).
-    """
     result = {"vol_7d_sol": 0.0, "single_funder": False,
               "funder_address": None, "flag": None}
     try:
         sigs = await _rpc("getSignaturesForAddress",
                           [dev_wallet, {"limit": 100, "commitment": "confirmed"}])
         if not sigs: return result
-
         cutoff = time.time() - 7 * 86400
         recent = [s for s in sigs if (s.get("blockTime") or 0) >= cutoff]
         if not recent: return result
-
         inflow_sources: Dict[str, float] = {}
-        for sig_info in recent[:30]:   # sample first 30
+        for sig_info in recent[:30]:
             try:
                 tx_data = await _rpc("getTransaction",
                     [sig_info["signature"],
                      {"encoding":"jsonParsed","maxSupportedTransactionVersion":0}])
                 if not tx_data: continue
-                meta    = tx_data.get("meta", {})
-                pre_b   = meta.get("preBalances", [])
-                post_b  = meta.get("postBalances", [])
+                meta      = tx_data.get("meta", {})
+                pre_b     = meta.get("preBalances", [])
+                post_b    = meta.get("postBalances", [])
                 acct_keys = (tx_data.get("transaction",{})
                              .get("message",{}).get("accountKeys",[]))
                 for i, key in enumerate(acct_keys):
                     addr = key if isinstance(key, str) else key.get("pubkey","")
                     if addr == dev_wallet and i < len(pre_b) and i < len(post_b):
                         delta = (post_b[i] - pre_b[i]) / 1e9
-                        if delta > 0.01:   # received SOL
-                            # find sender (largest outflow)
+                        if delta > 0.01:
                             for j, k2 in enumerate(acct_keys):
                                 a2 = k2 if isinstance(k2, str) else k2.get("pubkey","")
                                 if a2 != dev_wallet and j < len(pre_b) and j < len(post_b):
@@ -523,40 +543,31 @@ async def fingerprint_dev_wallet(dev_wallet: str) -> Dict:
                                     if d2 > 0:
                                         inflow_sources[a2] = inflow_sources.get(a2, 0) + d2
                         result["vol_7d_sol"] += max(delta, 0)
-                await asyncio.sleep(0.05)   # avoid rate limit
+                await asyncio.sleep(0.05)
             except: continue
-
         if inflow_sources:
             top_src, top_amt = max(inflow_sources.items(), key=lambda x: x[1])
             total_inflow     = sum(inflow_sources.values())
             if total_inflow > 0 and top_amt / total_inflow >= 0.80:
-                result["single_funder"]   = True
-                result["funder_address"]  = top_src
-                result["flag"]            = f"🔴 Funded 80%+ from single source"
+                result["single_funder"]  = True
+                result["funder_address"] = top_src
+                result["flag"]           = "🔴 Funded 80%+ from single source"
     except Exception as e:
         logger.debug(f"Fingerprint error {dev_wallet[:20]}: {e}")
     return result
 
 # ── GRADUATION DETECTION ──────────────────────────────────────────────────────
 async def is_graduated(mint: str) -> bool:
-    """
-    A pump.fun token graduates when bonding curve fills (~85 SOL raised).
-    After graduation, pump.fun routes no longer work — must use Jupiter/Raydium.
-    """
     try:
-        result = await _rpc("getTokenLargestAccounts",
-                            [mint, {"commitment":"confirmed"}])
+        result   = await _rpc("getTokenLargestAccounts", [mint, {"commitment":"confirmed"}])
         if not result: return False
         accounts = result.get("value", [])
-        if not accounts: return True   # no curve account = graduated
-        largest = float(accounts[0].get("uiAmount") or 0)
-        # If bonding curve holds <5% of supply, coin has graduated
-        total_supply = 1_000_000_000
-        curve_pct    = largest / total_supply * 100
-        return curve_pct < 5.0
+        if not accounts: return True
+        largest  = float(accounts[0].get("uiAmount") or 0)
+        return (largest / 1_000_000_000 * 100) < 5.0
     except: return False
 
-# ── TRANSACTION ENGINE ────────────────────────────────────────────────────────
+# ── RPC ───────────────────────────────────────────────────────────────────────
 async def _rpc(method: str, params: list) -> Optional[Dict]:
     try:
         rpc_url = f"https://mainnet.helius-rpc.com/?api-key={os.getenv('HELIUS_API_KEY','')}"
@@ -588,8 +599,10 @@ async def send_transaction_fast(tx_bytes: bytes, keypair,
     tx     = VersionedTransaction.from_bytes(tx_bytes)
     signed = VersionedTransaction(tx.message, [keypair])
     tx_b64 = base64.b64encode(bytes(signed)).decode()
+    rpc_url = f"https://mainnet.helius-rpc.com/?api-key={os.getenv('HELIUS_API_KEY','')}"
+    endpoints = [rpc_url, "https://api.mainnet-beta.solana.com"]
     results = await asyncio.gather(
-        *[_send_to_rpc(u, tx_b64, skip) for u in RPC_ENDPOINTS],
+        *[_send_to_rpc(u, tx_b64, skip) for u in endpoints],
         return_exceptions=True)
     for r in results:
         if isinstance(r, str) and r: return r
@@ -616,8 +629,8 @@ async def confirm_transaction(sig: str, timeout_s: int = 25) -> bool:
 # ── CURRENT VALUE ─────────────────────────────────────────────────────────────
 async def get_position_value_sol(mint: str, token_amount: float) -> float:
     try:
-        data     = await _rpc("getTokenSupply", [mint])
-        decimals = (data or {}).get("value",{}).get("decimals",6)
+        data        = await _rpc("getTokenSupply", [mint])
+        decimals    = (data or {}).get("value",{}).get("decimals",6)
         token_lamps = int(token_amount * (10**decimals))
         if token_lamps <= 0: return 0.0
         async with aiohttp.ClientSession() as s:
@@ -682,15 +695,9 @@ async def execute_user_buy(user_id: int, mint: str, name: str,
                            symbol: str, momentum: Dict,
                            top_holders: Optional[List[str]] = None
                            ) -> Tuple[bool, str, str, float, str]:
-    """
-    Returns (success, tx_or_err, method, buy_sol, exit_mode).
-    Includes: blacklist check, cross-position risk cap, dynamic sizing,
-    graduation routing, fingerprinting guard.
-    """
     user = await get_sniper_user(user_id)
     if not user or not user["sniper_enabled"]:
         return False, "sniper off", "none", 0, ""
-
     lba = user.get("last_buy_at") or 0
     if time.time() - lba < MIN_BUY_INTERVAL:
         return False, "rate limited", "none", 0, ""
@@ -699,30 +706,33 @@ async def execute_user_buy(user_id: int, mint: str, name: str,
     pubkey    = user["pubkey"]
     exit_mode = classify_exit_mode(momentum)
 
-    # ── BLACKLIST CHECK ────────────────────────────────────────────────────
     if top_holders:
         for holder in top_holders[:5]:
             if await is_blacklisted(holder):
-                logger.info(f"Skipping {mint[:20]}: blacklisted holder {holder[:20]}")
                 return False, "blacklisted holder in top 5", "none", 0, ""
 
-    # ── CROSS-POSITION RISK CAP ────────────────────────────────────────────
-    bal         = await get_sol_balance(pubkey)
-    exposure    = await get_total_open_exposure(user_id)
+    bal          = await get_sol_balance(pubkey)
+    exposure     = await get_total_open_exposure(user_id)
     max_exposure = bal * MAX_OPEN_EXPOSURE_PCT
     if exposure >= max_exposure:
         return False, f"exposure cap hit ({exposure:.3f}/{max_exposure:.3f} SOL)", "none", 0, ""
 
-    # ── DYNAMIC SIZING ─────────────────────────────────────────────────────
-    buy_sol = calc_buy_size(bal, profile)
-    needed  = buy_sol + profile["priority_fee"] + 0.01
-    if bal < needed:
-        return False, f"low balance {bal:.3f} SOL", "none", 0, ""
+    # ── SIZING: custom amount or profile % ────────────────────────────────
+    custom_amt = await get_custom_amount(user_id)
+    buy_sol    = calc_buy_size(bal, profile, custom_amt)
 
-    # ── ROUTE SELECTION ────────────────────────────────────────────────────
-    enc_key    = await _get_encrypted_key(user_id)
-    kp         = load_keypair(enc_key)
-    graduated  = await is_graduated(mint)
+    if buy_sol <= 0:
+        fee = profile["priority_fee"] + 0.005
+        return False, f"balance too low for fees (have {bal:.4f} SOL, need >{fee:.3f} SOL)", "none", 0, ""
+
+    # Low balance warning — log it but don't block
+    fee_needed = profile["priority_fee"] + 0.005
+    if bal < buy_sol + fee_needed:
+        logger.warning(f"User {user_id} low balance {bal:.4f} SOL for {buy_sol} SOL trade")
+
+    enc_key   = await _get_encrypted_key(user_id)
+    kp        = load_keypair(enc_key)
+    graduated = await is_graduated(mint)
 
     if not graduated:
         ok, sig = await _buy_pumpfun(mint, pubkey, kp, profile, buy_sol)
@@ -732,7 +742,6 @@ async def execute_user_buy(user_id: int, mint: str, name: str,
             ok, sig = await _buy_jupiter(mint, pubkey, kp, profile, buy_sol)
             method  = "jupiter"
     else:
-        # Token already graduated to Raydium — go straight to Jupiter
         ok, sig = await _buy_jupiter(mint, pubkey, kp, profile, buy_sol)
         method  = "jupiter(graduated)"
 
@@ -744,7 +753,6 @@ async def execute_user_buy(user_id: int, mint: str, name: str,
                         sol_spent=buy_sol, token_amount=token_amt,
                         buy_tx=sig, exit_mode=exit_mode)
     await set_last_buy(user_id)
-
     logger.info(f"BUY user={user_id} {name} {buy_sol}SOL via {method} mode={exit_mode}")
     return True, sig, method, buy_sol, exit_mode
 
@@ -788,16 +796,12 @@ async def execute_full_sell(pos: Dict, reason: str) -> Tuple[bool, str, float, f
     profile = RISK_PROFILES[user["risk_profile"]]
     kp      = load_keypair(enc_key)
     pubkey  = user["pubkey"]
-
     token_amt = await get_token_balance(pubkey, pos["mint"])
     if token_amt <= 0:
         await close_position(pos["id"], "sold_"+reason, "no_balance", 0, 0)
         return False, "no balance", 0, 0
-
-    ok, sig, sol_out = await _sell_via_jupiter(
-        pos["mint"], token_amt, pubkey, kp, profile)
+    ok, sig, sol_out = await _sell_via_jupiter(pos["mint"], token_amt, pubkey, kp, profile)
     if not ok: return False, sig, 0, 0
-
     pnl_sol = round(sol_out - pos["sol_spent"], 4)
     pnl_pct = round((sol_out / pos["sol_spent"] - 1) * 100, 1)
     status  = {"tp":"sold_tp","sl":"sold_sl","rug":"sold_rug",
@@ -814,26 +818,19 @@ async def execute_partial_sell(pos: Dict, pct: float,
     profile = RISK_PROFILES[user["risk_profile"]]
     kp      = load_keypair(enc_key)
     pubkey  = user["pubkey"]
-
     token_amt      = await get_token_balance(pubkey, pos["mint"])
     tokens_to_sell = token_amt * pct
     if tokens_to_sell <= 0: return False, "no tokens", 0
-
     ok, sig, sol_out = await _sell_via_jupiter(
         pos["mint"], tokens_to_sell, pubkey, kp, profile)
     if not ok: return False, sig, 0
-
-    remaining = token_amt - tokens_to_sell
-    await mark_tier_sold(pos["id"], tier, remaining)
+    await mark_tier_sold(pos["id"], tier, token_amt - tokens_to_sell)
     return True, sig, sol_out
 
-# ── MANUAL SELL (from /sell command) ─────────────────────────────────────────
 async def execute_manual_sell(user_id: int, pos_id: int) -> Tuple[bool, str, float, float]:
-    """Called from Telegram /sell command. Returns (ok, sig, pnl_sol, pnl_pct)."""
     positions = await get_open_positions(user_id)
     pos = next((p for p in positions if p["id"] == pos_id), None)
-    if not pos:
-        return False, "position not found", 0, 0
+    if not pos: return False, "position not found", 0, 0
     return await execute_full_sell(pos, "manual")
 
 # ── ALERT CALLBACK ────────────────────────────────────────────────────────────
@@ -880,7 +877,6 @@ async def position_monitor_loop():
                 pnl_sol  = round(current_val - sol_spent, 4)
                 age_mins = round((time.time() - pos["bought_at"]) / 60, 1)
 
-                # ── UPDATE PEAK + TRAIL ────────────────────────────────────
                 peak = pos["peak_value_sol"] or sol_spent
                 if current_val > peak:
                     peak       = current_val
@@ -891,7 +887,7 @@ async def position_monitor_loop():
                 peak_ratio = peak / sol_spent
                 trail_stop = pos["trailing_stop"] or (sol_spent * (1 - profile["trailing_stop_pct"]))
 
-                # ── HAIR TRIGGER RUG ───────────────────────────────────────
+                # Hair trigger rug
                 prev_val = _prev_values.get(pos["id"], current_val)
                 if prev_val > 0:
                     drop_pct = (prev_val - current_val) / prev_val
@@ -908,7 +904,6 @@ async def position_monitor_loop():
                         _prev_values.pop(pos["id"], None); continue
                 _prev_values[pos["id"]] = current_val
 
-                # ── MOMENTUM MODE: tiered ──────────────────────────────────
                 if exit_mode == "momentum":
                     if not pos["tier1_sold"] and ratio >= profile["tiered_t1_mult"]:
                         ok, sig, sol_out = await execute_partial_sell(pos, 0.40, 1)
@@ -945,7 +940,6 @@ async def position_monitor_loop():
                                 f"PnL: {pnl:.4f} SOL ({pct_:.1f}%)\n`{sig[:20]}...`")
                         _prev_values.pop(pos["id"], None); continue
 
-                # ── STEADY MODE: trailing ──────────────────────────────────
                 elif exit_mode == "steady":
                     if current_val <= trail_stop and peak_ratio >= 1.0:
                         ok, sig, pnl, pct_ = await execute_full_sell(pos, "tp")
@@ -956,8 +950,7 @@ async def position_monitor_loop():
                                 f"Peak {peak_ratio:.2f}x · Exit {ratio:.2f}x\n"
                                 f"PnL: {'+' if pnl>=0 else ''}{pnl:.4f} SOL ({pct_:.1f}%)\n`{sig[:20]}...`")
                         _prev_values.pop(pos["id"], None); continue
-                    hard_sl = 1 - profile["trailing_stop_pct"] - 0.05
-                    if ratio <= hard_sl:
+                    if ratio <= (1 - profile["trailing_stop_pct"] - 0.05):
                         ok, sig, pnl, pct_ = await execute_full_sell(pos, "sl")
                         if ok:
                             await _notify(uid,
@@ -965,7 +958,6 @@ async def position_monitor_loop():
                                 f"PnL: {pnl:.4f} SOL ({pct_:.1f}%)\n`{sig[:20]}...`")
                         _prev_values.pop(pos["id"], None); continue
 
-                # ── WEAK MODE: fixed ───────────────────────────────────────
                 elif exit_mode == "weak":
                     if ratio >= profile["fixed_tp"]:
                         ok, sig, pnl, pct_ = await execute_full_sell(pos, "tp")
@@ -982,7 +974,6 @@ async def position_monitor_loop():
                                 f"PnL: {pnl:.4f} SOL ({pct_:.1f}%)\n`{sig[:20]}...`")
                         _prev_values.pop(pos["id"], None); continue
 
-                # ── TIME DECAY ─────────────────────────────────────────────
                 if age_mins >= profile["time_decay_mins"] and ratio < 1.2:
                     ok, sig, pnl, pct_ = await execute_full_sell(pos, "time_decay")
                     if ok:
@@ -992,7 +983,6 @@ async def position_monitor_loop():
                             f"PnL: {'+' if pnl>=0 else ''}{pnl:.4f} SOL ({pct_:.1f}%)\n`{sig[:20]}...`")
                     _prev_values.pop(pos["id"], None); continue
 
-                # ── LIVE PnL UPDATE ────────────────────────────────────────
                 last_upd = pos.get("last_update_at") or 0
                 if time.time() - last_upd >= LIVE_UPDATE_INTERVAL:
                     emoji      = _pnl_emoji(pnl_pct)
