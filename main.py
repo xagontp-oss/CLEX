@@ -29,7 +29,7 @@ from sniper import (
     get_open_positions, get_performance_stats, get_blacklist_count,
     get_sol_balance, validate_private_key, get_setup_state,
     set_setup_state, clear_setup_state, position_monitor_loop,
-    set_alert_callback,
+    set_alert_callback, set_custom_amount, get_custom_amount,
 )
 
 # ── ENV ───────────────────────────────────────────────────────────────────────
@@ -56,7 +56,6 @@ PUMP_PROGRAM = "6EF8rQNi1oDEZ7zrKsCauKMorruBaGECQw6B469Z7z8"
 WSOL_MINT    = "So11111111111111111111111111111111111111112"
 TOTAL_SUPPLY = 1_000_000_000
 
-# ── LOGGING — only keep important events, suppress noise ──────────────────────
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
     format="%(asctime)s | %(levelname)s | %(message)s"
@@ -428,7 +427,6 @@ async def fire_alert(entry: WatchlistEntry, momentum: Dict):
             logger.error(f"Send error to {chat_id}: {e}")
 
     top_holders = []
-
     snipers = await get_enabled_snipers()
     for su in snipers:
         uid = su["user_id"]
@@ -527,9 +525,10 @@ def sniper_menu_kb(user: Optional[Dict]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=toggle_text, callback_data="sniper_toggle")],
         [InlineKeyboardButton(text="⚡ Change Risk Profile", callback_data="sniper_risk")],
-        [InlineKeyboardButton(text="📈 My Positions",        callback_data="sniper_positions")],
-        [InlineKeyboardButton(text="🗑 Delete Wallet",       callback_data="sniper_delete_confirm")],
-        [InlineKeyboardButton(text="⬅️ Back",                callback_data="back")],
+        [InlineKeyboardButton(text="💰 Set Custom Amount",  callback_data="sniper_custom_amount")],
+        [InlineKeyboardButton(text="📈 My Positions",       callback_data="sniper_positions")],
+        [InlineKeyboardButton(text="🗑 Delete Wallet",      callback_data="sniper_delete_confirm")],
+        [InlineKeyboardButton(text="⬅️ Back",               callback_data="back")],
     ])
 
 def risk_kb(prefix: str) -> InlineKeyboardMarkup:
@@ -542,6 +541,11 @@ def risk_kb(prefix: str) -> InlineKeyboardMarkup:
                               callback_data=f"{prefix}_psycho")],
         [InlineKeyboardButton(text="⬅️ Back", callback_data="sniper_menu")],
     ])
+
+# ── USER INPUT STATE ──────────────────────────────────────────────────────────
+# stores: "key" | "custom_amount"
+user_input_state: Dict[int, str] = {}
+user_sell_pending: Dict[int, int] = {}
 
 # ── BOT HANDLERS ──────────────────────────────────────────────────────────────
 @router.message(Command("start"))
@@ -642,8 +646,6 @@ async def performance_cmd(m: Message):
         f"*Last 5 trades:*\n{recent_block}",
         parse_mode=ParseMode.MARKDOWN)
 
-user_sell_pending: Dict[int, int] = {}
-
 @router.message(Command("sell"))
 async def sell_cmd(m: Message):
     uid       = m.from_user.id
@@ -724,15 +726,20 @@ async def sniper_menu(q: CallbackQuery):
             reply_markup=sniper_menu_kb(None),
             parse_mode=ParseMode.MARKDOWN)
     else:
-        profile = RISK_PROFILES[user["risk_profile"]]
-        status  = "🟢 ON" if user["sniper_enabled"] else "🔴 OFF"
-        bal     = await get_sol_balance(user["pubkey"])
+        profile     = RISK_PROFILES[user["risk_profile"]]
+        status      = "🟢 ON" if user["sniper_enabled"] else "🔴 OFF"
+        bal         = await get_sol_balance(user["pubkey"])
+        custom_amt  = await get_custom_amount(uid)
+        amount_line = f"Custom: {custom_amt} SOL per trade" if custom_amt else profile["desc"]
+        # Low balance warning
+        fee_needed  = profile["priority_fee"] + 0.005
+        warning     = "\n\n⚠️ *Balance very low — may not cover fees*" if bal < fee_needed else ""
         await q.message.edit_text(
             f"🔫 *CLEX Sniper*  {status}\n\n"
             f"Wallet: `{user['pubkey'][:20]}...`\n"
             f"Balance: {bal} SOL\n"
             f"Profile: {profile['label']}\n"
-            f"{profile['desc']}",
+            f"{amount_line}{warning}",
             reply_markup=sniper_menu_kb(user),
             parse_mode=ParseMode.MARKDOWN)
 
@@ -773,21 +780,90 @@ async def sniper_setup_risk(q: CallbackQuery):
 @router.callback_query(F.data == "sniper_cancel")
 async def sniper_cancel(q: CallbackQuery):
     await clear_setup_state(q.from_user.id)
+    user_input_state.pop(q.from_user.id, None)
     await q.answer("Cancelled")
     await sniper_menu(q)
 
-# ── PRIVATE KEY HANDLER ───────────────────────────────────────────────────────
+# ── CUSTOM AMOUNT ─────────────────────────────────────────────────────────────
+@router.callback_query(F.data == "sniper_custom_amount")
+async def sniper_custom_amount(q: CallbackQuery):
+    uid = q.from_user.id
+    user = await get_sniper_user(uid)
+    if not user:
+        await q.answer("Set up your sniper first"); return
+    custom = await get_custom_amount(uid)
+    profile = RISK_PROFILES[user["risk_profile"]]
+    current = f"{custom} SOL (custom)" if custom else f"{profile['buy_pct']*100:.0f}% of balance (profile default)"
+    user_input_state[uid] = "custom_amount"
+    await q.answer()
+    await q.message.edit_text(
+        f"💰 *Set Custom Trade Amount*\n\n"
+        f"Current: {current}\n\n"
+        f"Send the SOL amount you want per trade (e.g. `0.05`).\n"
+        f"Or tap *Use Profile Default* to go back to percentage-based sizing.\n\n"
+        f"⚠️ A warning will show if your balance is too low to cover fees.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Use Profile Default", callback_data="sniper_clear_custom")],
+            [InlineKeyboardButton(text="❌ Cancel", callback_data="sniper_cancel")],
+        ]),
+        parse_mode=ParseMode.MARKDOWN)
+
+@router.callback_query(F.data == "sniper_clear_custom")
+async def sniper_clear_custom(q: CallbackQuery):
+    await set_custom_amount(q.from_user.id, None)
+    user_input_state.pop(q.from_user.id, None)
+    await q.answer("✅ Back to profile default")
+    await sniper_menu(q)
+
+# ── MESSAGE HANDLER (private key + custom amount) ─────────────────────────────
 @router.message()
 async def handle_message(m: Message):
     uid   = m.from_user.id
-    state = await get_setup_state(uid)
+    istate = user_input_state.get(uid)
+    state  = await get_setup_state(uid)
+
+    # ── Custom amount input ────────────────────────────────────────────────
+    if istate == "custom_amount":
+        raw = (m.text or "").strip()
+        try:
+            amount = float(raw)
+            if amount <= 0:
+                raise ValueError
+        except ValueError:
+            await m.answer("❌ Invalid amount. Send a number like `0.05`")
+            return
+
+        user    = await get_sniper_user(uid)
+        profile = RISK_PROFILES[user["risk_profile"]]
+        bal     = await get_sol_balance(user["pubkey"])
+        fee     = profile["priority_fee"] + 0.005
+
+        warning = ""
+        if amount + fee > bal:
+            warning = (f"\n\n⚠️ *Low balance warning*\n"
+                       f"You have {bal:.4f} SOL. This trade + fees ({fee:.3f} SOL) "
+                       f"may exceed your balance. The trade will be skipped if funds are insufficient.")
+
+        await set_custom_amount(uid, amount)
+        user_input_state.pop(uid, None)
+        await m.answer(
+            f"✅ *Custom amount set: {amount} SOL per trade*{warning}\n\n"
+            f"Open the Sniper menu to turn it on.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔫 Sniper Menu", callback_data="sniper_menu")]]))
+        return
+
+    # ── Private key input ──────────────────────────────────────────────────
     if not state or state["step"] != "key":
         return
+
     raw_key = (m.text or "").strip()
     try:
         await bot.delete_message(m.chat.id, m.message_id)
     except:
         pass
+
     valid, pubkey, err = validate_private_key(raw_key)
     if not valid:
         await bot.send_message(uid,
@@ -795,6 +871,7 @@ async def handle_message(m: Message):
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="❌ Cancel", callback_data="sniper_cancel")]]))
         return
+
     risk    = state["risk"]
     profile = RISK_PROFILES[risk]
     bal     = await get_sol_balance(pubkey)
@@ -819,14 +896,6 @@ async def sniper_toggle(q: CallbackQuery):
     if not user:
         await q.answer("Set up your sniper first"); return
     new_state = not user["sniper_enabled"]
-    if new_state:
-        profile = RISK_PROFILES[user["risk_profile"]]
-        bal     = await get_sol_balance(user["pubkey"])
-        needed  = profile["min_buy"] + profile["priority_fee"] + 0.01
-        if bal < needed:
-            await q.answer(
-                f"Insufficient balance! Need {needed:.3f} SOL, have {bal:.3f} SOL",
-                show_alert=True); return
     await toggle_sniper(uid, new_state)
     await q.answer("🟢 Sniper ON" if new_state else "🔴 Sniper OFF")
     await sniper_menu(q)
