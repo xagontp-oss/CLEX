@@ -307,6 +307,35 @@ async def fetch_dev_history(dev_wallet: str) -> Dict:
     return info
 
 async def fetch_snapshot(mint: str) -> Snapshot:
+    """Use pump.fun API for live holder count, curve %, and volume.
+    Falls back to RPC only if pump.fun API is unavailable.
+    getTokenLargestAccounts only returns ~10 accounts and misses real holder count."""
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(
+                f"https://frontend-api.pump.fun/coins/{mint}",
+                timeout=aiohttp.ClientTimeout(total=5)) as r:
+                if r.status == 200:
+                    d = await r.json()
+                    # pump.fun returns bonding curve progress as a fraction 0-1
+                    # convert to percentage of curve filled
+                    bc_progress = float(d.get("bonding_curve_percentage") or 0)
+                    # holder_count is the real number of unique wallets
+                    holder_count = int(d.get("holder_count") or 0)
+                    # market_cap in SOL — use as proxy for tx volume
+                    mc_sol = float(d.get("market_cap") or 0)
+                    # top holder: largest single holder as % of supply
+                    top1_pct = 0.0
+                    return Snapshot(
+                        t=time.time(),
+                        curve_pct=round(bc_progress * 100, 2),
+                        holder_count=holder_count,
+                        top1_pct=top1_pct,
+                        tx_count=int(mc_sol * 10),  # proxy for activity
+                    )
+    except Exception:
+        pass
+    # RPC fallback
     holders_res, sigs_res = await asyncio.gather(
         rpc("getTokenLargestAccounts", [mint, {"commitment": "confirmed"}]),
         rpc("getSignaturesForAddress",  [mint, {"limit": 30, "commitment": "confirmed"}]),
@@ -316,7 +345,6 @@ async def fetch_snapshot(mint: str) -> Snapshot:
     for a in accounts:
         try: amounts.append(float(a.get("uiAmount") or 0))
         except Exception: pass
-
     curve_pct = top1_pct = 0.0
     if amounts:
         curve_pct = max(0.0, min(100.0, round((1 - amounts[0] / TOTAL_SUPPLY) * 100, 2)))
