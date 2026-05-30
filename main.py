@@ -612,18 +612,20 @@ async def process_payload(payload: list):
         if mint in watchlist or await already_seen(mint): continue
 
         # ── Freshness gate using pump.fun API timestamp ───────────────────
-        # Must be called first. pump.fun returns created_timestamp (unix secs).
-        # Stream backfills deliver old blocks on reconnect — this kills them.
         meta = await fetch_token_metadata(mint)
         created = meta.get("created_timestamp")
+        age_secs = 0
         if created:
-            age_secs = time.time() - float(created)
+            ts = float(created)
+            # Handle milliseconds — pump.fun sometimes returns ms
+            if ts > 1e12:
+                ts = ts / 1000.0
+            age_secs = time.time() - ts
             if age_secs > MAX_COIN_AGE_SECS:
                 logger.debug(f"Stale {mint[:12]} age={age_secs:.0f}s — dropped")
                 await mark_seen(mint)
                 continue
-        else:
-            age_secs = 0
+        # If no timestamp, allow it through — better to scan than miss
 
         await mark_seen(mint)
         dev = {}  # dev history not used — momentum-only strategy
