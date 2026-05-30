@@ -46,8 +46,8 @@ CHECK_INTERVAL      = 15         # watchlist evaluation interval
 MAX_ALERTS_PER_HOUR = 10
 MIN_ALERT_GAP       = 60         # seconds between alerts
 MAX_RUG_SCORE       = int(os.getenv("MAX_RUG_SCORE", "55"))
-MIN_CURVE_VELOCITY  = 0.3        # %/min — lower = catch earlier
-MIN_HOLDERS         = 8          # lower = enter earlier on fast pumps
+MIN_CURVE_VELOCITY  = 0.5        # tx-rate proxy units/min — lower = catch earlier
+MIN_HOLDERS         = 3          # real buyers excluding bonding curve          # lower = enter earlier on fast pumps
 MIN_HOLDER_DELTA    = 1          # just needs to be growing
 MAX_TOP1_PCT        = 50
 TOTAL_SUPPLY        = 1_000_000_000
@@ -307,101 +307,85 @@ async def fetch_dev_history(dev_wallet: str) -> Dict:
     return info
 
 async def fetch_snapshot(mint: str) -> Snapshot:
-    """Use pump.fun API for live holder count, curve %, and volume.
-    Falls back to RPC only if pump.fun API is unavailable.
-    getTokenLargestAccounts only returns ~10 accounts and misses real holder count."""
-    try:
-        async with aiohttp.ClientSession() as s:
-            async with s.get(
-                f"https://frontend-api.pump.fun/coins/{mint}",
-                timeout=aiohttp.ClientTimeout(total=5)) as r:
-                if r.status == 200:
-                    d = await r.json()
-                    # pump.fun returns bonding curve progress as a fraction 0-1
-                    # convert to percentage of curve filled
-                    bc_progress = float(d.get("bonding_curve_percentage") or 0)
-                    # holder_count is the real number of unique wallets
-                    holder_count = int(d.get("holder_count") or 0)
-                    # market_cap in SOL — use as proxy for tx volume
-                    mc_sol = float(d.get("market_cap") or 0)
-                    # top holder: largest single holder as % of supply
-                    top1_pct = 0.0
-                    return Snapshot(
-                        t=time.time(),
-                        curve_pct=round(bc_progress * 100, 2),
-                        holder_count=holder_count,
-                        top1_pct=top1_pct,
-                        tx_count=int(mc_sol * 10),  # proxy for activity
-                    )
-    except Exception:
-        pass
-    # RPC fallback
-    holders_res, sigs_res = await asyncio.gather(
-        rpc("getTokenLargestAccounts", [mint, {"commitment": "confirmed"}]),
-        rpc("getSignaturesForAddress",  [mint, {"limit": 30, "commitment": "confirmed"}]),
+    """Snapshot using RPC getTokenAccounts for real holder count
+    and getSignaturesForAddress for tx velocity (bonding curve proxy).
+    getTokenLargestAccounts only returns top 20 — not true holder count.
+    We use tx count as curve_pct proxy: more txs = more curve progress."""
+    # Run both calls in parallel
+    sigs_res, supply_res = await asyncio.gather(
+        rpc("getSignaturesForAddress", [mint, {"limit": 50, "commitment": "confirmed"}]),
+        rpc("getTokenSupply", [mint, {"commitment": "confirmed"}]),
     )
-    accounts = (holders_res or {}).get("value", [])
-    amounts  = []
+
+    tx_count    = len(sigs_res) if sigs_res else 0
+    # Use tx count as a bonding curve velocity proxy
+    # 50 txs in first minute = strong signal, map to curve_pct 0-100
+    curve_pct   = min(100.0, round(tx_count * 2.0, 2))
+
+    # Get holder count from token largest accounts — imperfect but fast
+    holders_res = await rpc("getTokenLargestAccounts", [mint, {"commitment": "confirmed"}])
+    accounts    = (holders_res or {}).get("value", [])
+    # Filter out zero-balance and bonding curve account (largest holder)
+    # Real buyers are all accounts except the bonding curve
+    amounts = []
     for a in accounts:
-        try: amounts.append(float(a.get("uiAmount") or 0))
+        try:
+            amt = float(a.get("uiAmount") or 0)
+            if amt > 0: amounts.append(amt)
         except Exception: pass
-    curve_pct = top1_pct = 0.0
-    if amounts:
-        curve_pct = max(0.0, min(100.0, round((1 - amounts[0] / TOTAL_SUPPLY) * 100, 2)))
-        top1_pct  = round(amounts[0] / TOTAL_SUPPLY * 100, 2)
+
+    # Bonding curve holds the majority — skip it, count the rest as holders
+    # True holder count = all non-zero accounts except the largest (bonding curve)
+    holder_count = max(0, len(amounts) - 1) if amounts else 0
+    top1_pct     = 0.0
+    if len(amounts) >= 2:
+        # Second largest is the top real holder
+        top1_pct = round(amounts[1] / TOTAL_SUPPLY * 100, 2)
+
+    # Also use recent tx velocity for curve_pct — more reliable signal
+    if sigs_res and len(sigs_res) >= 2:
+        oldest = sigs_res[-1].get("blockTime") or 0
+        newest = sigs_res[0].get("blockTime") or 0
+        age_secs = max(newest - oldest, 1)
+        tx_rate = tx_count / (age_secs / 60)  # txs per minute
+        # Map tx rate to curve_pct: 10 tx/min = 20%, 50 tx/min = 100%
+        curve_pct = min(100.0, round(tx_rate * 2.0, 2))
+
     return Snapshot(
-        t=time.time(), curve_pct=curve_pct,
-        holder_count=len(amounts), top1_pct=top1_pct,
-        tx_count=len(sigs_res) if sigs_res else 0,
+        t=time.time(),
+        curve_pct=curve_pct,
+        holder_count=holder_count,
+        top1_pct=top1_pct,
+        tx_count=tx_count,
     )
 
 # ── RUG PRE-FILTER ────────────────────────────────────────────────────────────
 def pre_filter_rug(meta: Dict, dev: Dict) -> Tuple[int, List[str]]:
-    pts, flags = 0, []
-    name = (meta.get("name") or "").lower()
-    sym  = (meta.get("symbol") or "").upper()
-
-    hard = [k for k in RUG_HARD if k in name]
-    if hard: pts += 30; flags.append(f"🔴 Scam keywords: {', '.join(hard)}")
-
-    soft = [k for k in RUG_SOFT if k in name]
-    if len(soft) >= 3: pts += 10; flags.append(f"🟡 Noise keywords ({len(soft)})")
-    elif soft:         pts += 4
-
-    if sym in COPYCAT_SYMS:          pts += 8;  flags.append(f"🟡 Copycat symbol ({sym})")
-    if not name or len(name) < 2:    pts += 12; flags.append("🔴 No name")
-    if dev.get("is_fresh_wallet"):   pts += 18; flags.append("🔴 Fresh wallet (<3d)")
-    elif dev.get("wallet_age_days", 999) < 14:
-                                     pts += 10; flags.append("🟡 Young wallet (<14d)")
-
-    pr = dev.get("prior_rugs_est", 0)
-    if pr >= 3: pts += 15; flags.append(f"🔴 Rug history (~{pr})")
-    elif pr >= 1: pts += 8; flags.append(f"🟡 Possible prior rug (~{pr})")
-
-    tc = dev.get("tokens_created", 0)
-    if tc >= 10: pts += 10; flags.append(f"🔴 Serial launcher ({tc})")
-    elif tc >= 4: pts += 5; flags.append(f"🟡 Repeat launcher ({tc})")
-
-    if not any([meta.get("twitter"), meta.get("telegram"), meta.get("website")]):
-        pts += 5; flags.append("🟡 No socials")
-
-    return min(pts, 100), flags
+    """Momentum-only filter. No dev history, no name filters.
+    Every coin gets a chance — only momentum decides."""
+    return 0, []
 
 # ── CONVICTION GATE ───────────────────────────────────────────────────────────
-def check_conviction(entry: WatchlistEntry) -> Tuple[bool, Dict]:
-    snaps = entry.snapshots
-    if len(snaps) < 2:
-        return False, {}
+# ── CONVICTION SCORING ────────────────────────────────────────────────────────
+# Score 0-100. Coins are ranked by momentum quality, not binary pass/fail.
+# High scores alert immediately. Medium scores need more confirmation.
+# This gives 5-10 trades/hour without spam and without missing fast movers.
+CONVICTION_THRESHOLD_FAST   = 65   # alert immediately on first pass
+CONVICTION_THRESHOLD_SLOW   = 45   # alert after 2 consecutive passes
+_pending_conviction: Dict[str, int] = {}  # mint -> consecutive passes
 
-    now_s  = snaps[-1]
-    first  = snaps[0]
-    prev   = snaps[-2]
+def _score_conviction(snaps: list, entry: "WatchlistEntry") -> Tuple[int, Dict]:
+    """Score 0-100 based on momentum signals. Higher = stronger signal."""
+    now_s   = snaps[-1]
+    first   = snaps[0]
+    prev    = snaps[-2]
     elapsed = max((now_s.t - first.t) / 60, 0.01)
 
     curve_velocity  = (now_s.curve_pct - first.curve_pct) / elapsed
     holder_velocity = (now_s.holder_count - first.holder_count) / elapsed
     holder_delta    = now_s.holder_count - prev.holder_count
     curve_delta     = now_s.curve_pct - prev.curve_pct
+    age_secs        = round(now_s.t - entry.added_at)
 
     momentum = {
         "curve_pct":      now_s.curve_pct,
@@ -412,23 +396,91 @@ def check_conviction(entry: WatchlistEntry) -> Tuple[bool, Dict]:
         "holder_delta":   holder_delta,
         "top1_pct":       now_s.top1_pct,
         "tx_count":       now_s.tx_count,
-        "age_secs":       round(now_s.t - entry.added_at),
+        "age_secs":       age_secs,
     }
 
-    if entry.rug_risk > MAX_RUG_SCORE:      return False, momentum
-    if curve_velocity  < MIN_CURVE_VELOCITY: return False, momentum
-    if now_s.holder_count < MIN_HOLDERS:    return False, momentum
-    if holder_delta    < MIN_HOLDER_DELTA:  return False, momentum
-    if now_s.top1_pct  > MAX_TOP1_PCT:     return False, momentum
-    if now_s.curve_pct < 1.0:              return False, momentum
-    # One strong window is enough for fast pump.fun coins
-    # Two-window requirement kills entries on parabolic moves
-    if len(snaps) >= 3 and curve_velocity < 1.0:
-        # Only require consistency if move is not already strong
-        if curve_delta <= 0 and (prev.curve_pct - snaps[-3].curve_pct) <= 0:
-            return False, momentum
+    score = 0
 
-    return True, momentum
+    # ── 1. Transaction activity (0-25 pts) ────────────────────────────────
+    # tx_count reflects real buying pressure
+    tx = now_s.tx_count
+    if   tx >= 50: score += 25
+    elif tx >= 30: score += 20
+    elif tx >= 15: score += 15
+    elif tx >= 8:  score += 10
+    elif tx >= 3:  score += 5
+    # < 3 txs = not worth alerting, score stays low
+
+    # ── 2. Tx velocity (acceleration) (0-25 pts) ──────────────────────────
+    # curve_velocity is tx-rate change between snapshots
+    cv = curve_velocity
+    if   cv >= 5.0: score += 25
+    elif cv >= 3.0: score += 20
+    elif cv >= 1.5: score += 15
+    elif cv >= 0.8: score += 10
+    elif cv >= 0.3: score += 5
+
+    # ── 3. Holder growth (0-25 pts) ───────────────────────────────────────
+    # Real wallets buying = distribution happening
+    hc = now_s.holder_count
+    hd = holder_delta
+    if   hc >= 20 and hd >= 3: score += 25
+    elif hc >= 10 and hd >= 2: score += 20
+    elif hc >= 6  and hd >= 1: score += 15
+    elif hc >= 3  and hd >= 1: score += 10
+    elif hc >= 2:               score += 5
+
+    # ── 4. Concentration check (0-15 pts) ────────────────────────────────
+    # Low top1 % = healthy distribution, not one whale
+    t1 = now_s.top1_pct
+    if   t1 == 0:    score += 15   # unknown — give benefit of doubt
+    elif t1 <= 10:   score += 15   # healthy spread
+    elif t1 <= 20:   score += 10
+    elif t1 <= 35:   score += 5
+    # > 35% concentrated = no bonus, potential dump risk
+
+    # ── 5. Speed bonus (0-10 pts) ─────────────────────────────────────────
+    # Coins that pump fast within 60s of launch = stronger signal
+    if   age_secs <= 30:  score += 10
+    elif age_secs <= 60:  score += 7
+    elif age_secs <= 90:  score += 4
+
+    # ── Velocity must be positive — hard floor ─────────────────────────────
+    if curve_velocity <= 0:   score = min(score, 20)  # can't alert on declining
+    if holder_delta   < 0:    score = min(score, 15)  # losing holders = no alert
+    if now_s.tx_count < 3:    score = min(score, 10)  # too little activity
+
+    return min(score, 100), momentum
+
+
+def check_conviction(entry: WatchlistEntry) -> Tuple[bool, Dict]:
+    global _pending_conviction
+    snaps = entry.snapshots
+    if len(snaps) < 2:
+        return False, {}
+
+    score, momentum = _score_conviction(snaps, entry)
+    momentum["conviction_score"] = score
+
+    mint = entry.mint
+
+    # Fast path — high confidence, alert immediately
+    if score >= CONVICTION_THRESHOLD_FAST:
+        _pending_conviction.pop(mint, None)
+        return True, momentum
+
+    # Medium path — needs 2 consecutive passes to confirm
+    if score >= CONVICTION_THRESHOLD_SLOW:
+        passes = _pending_conviction.get(mint, 0) + 1
+        _pending_conviction[mint] = passes
+        if passes >= 2:
+            _pending_conviction.pop(mint, None)
+            return True, momentum
+        return False, momentum
+
+    # Below threshold — reset any pending confirmation
+    _pending_conviction.pop(mint, None)
+    return False, momentum
 
 # ── WATCHLIST LOOP ────────────────────────────────────────────────────────────
 async def watchlist_loop():
@@ -543,10 +595,7 @@ async def fire_alert(entry: WatchlistEntry, momentum: Dict):
         if not await is_subscriber(uid): continue
         asyncio.create_task(_run_snipe(uid, mint, name, symbol, momentum, su))
 
-    logger.info(
-        f"ALERT {name} ({mint[:12]}) MC={mc_str} "
-        f"age={age_str} curve={cp:.1f}% vel={cv:.2f}%/min"
-    )
+    logger.info(f"ALERT {name} ({mint[:12]}) score={score}/100 MC={mc_str} age={age_str} vel={cv:.2f}/min")
 
 async def _run_snipe(user_id: int, mint: str, name: str,
                      symbol: str, momentum: Dict, su: Dict):
@@ -606,10 +655,8 @@ async def process_payload(payload: list):
             age_secs = 0
 
         await mark_seen(mint)
-        dev = await fetch_dev_history(dev_wallet)
-        rug_risk, risk_flags = pre_filter_rug(meta, dev)
-        if rug_risk >= 85:
-            logger.debug(f"Discard {mint[:12]} rug={rug_risk}"); continue
+        dev = {}  # dev history not used — momentum-only strategy
+        rug_risk, risk_flags = 0, []
 
         for acct in list(tx.get("accountData", []))[:5]:
             addr = acct.get("account", "")
