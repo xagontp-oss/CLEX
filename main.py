@@ -304,8 +304,8 @@ async def fetch_snapshot(mint: str) -> Snapshot:
     """Bonding curve % + holder count + tx count via Quicknode RPC.
     Same logic as the original that produced good callouts."""
     holders_res, sigs_res = await asyncio.gather(
-        rpc("getTokenLargestAccounts", [mint, {"commitment": "confirmed"}]),
-        rpc("getSignaturesForAddress",  [mint, {"limit": 30, "commitment": "confirmed"}]),
+        rpc("getTokenLargestAccounts", [mint, {"commitment": "processed"}]),
+        rpc("getSignaturesForAddress",  [mint, {"limit": 30, "commitment": "processed"}]),
     )
     accounts = (holders_res or {}).get("value", [])
     amounts  = []
@@ -526,13 +526,19 @@ async def _run_snipe(user_id: int, mint: str, name: str,
 def _extract_launch(tx: Dict) -> Optional[Tuple[str, str]]:
     if tx.get("type") != "CREATE": return None
     dev = tx.get("feePayer", "")
+    # tokenTransfers FIRST — the Quicknode stream filter explicitly
+    # identified this address as the mint ending in "pump".
+    # accountData contains ALL keys including bonding curve PDAs
+    # which can also end in "pump" and would be selected incorrectly.
+    for t in tx.get("tokenTransfers", []):
+        mint = t.get("mint", "")
+        if mint and len(mint) >= 32:
+            return mint, dev
+    # fallback: accountData
     for acct in tx.get("accountData", []):
         addr = acct.get("account", "")
         if addr.endswith("pump") and len(addr) in (43, 44):
             return addr, dev
-    for t in tx.get("tokenTransfers", []):
-        mint = t.get("mint", "")
-        if mint.endswith("pump"): return mint, dev
     return None
 
 async def process_payload(payload: list):
