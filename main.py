@@ -1,6 +1,7 @@
 """
 CLEX — pump.fun callout + sniper bot.
-Quicknode stream delivery, pump.fun API metadata, full sniper pipeline.
+Quicknode stream → webhook delivery.
+Proven binary conviction gate. New sniper framework (tiered exits).
 """
 import asyncio
 import aiosqlite
@@ -40,17 +41,18 @@ import sniper as sn
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 DB_PATH        = "clex.db"
 
-# ── TUNING ────────────────────────────────────────────────────────────────────
-WATCHLIST_TTL       = 300        # seconds a coin stays in watchlist
-CHECK_INTERVAL      = 15         # watchlist evaluation interval
+# ── TUNING — original values that produced good callouts ─────────────────────
+WATCHLIST_TTL       = 300
+CHECK_INTERVAL      = 15
 MAX_ALERTS_PER_HOUR = 10
-MIN_ALERT_GAP       = 60         # seconds between alerts
+MIN_ALERT_GAP       = 60
 MAX_RUG_SCORE       = int(os.getenv("MAX_RUG_SCORE", "55"))
-MIN_CURVE_VELOCITY  = 0.5        # tx-rate proxy units/min — lower = catch earlier
-MIN_HOLDERS         = 3          # real buyers excluding bonding curve          # lower = enter earlier on fast pumps
-MIN_HOLDER_DELTA    = 1          # just needs to be growing
+MIN_CURVE_VELOCITY  = 0.4    # proven threshold
+MIN_HOLDERS         = 12     # proven threshold
+MIN_HOLDER_DELTA    = 2      # proven threshold
 MAX_TOP1_PCT        = 50
 TOTAL_SUPPLY        = 1_000_000_000
+MAX_COIN_AGE_SLOTS  = 200    # ~80 seconds at 400ms/slot
 
 PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 
@@ -67,20 +69,45 @@ dp     = Dispatcher()
 router = Router()
 dp.include_router(router)
 
-# ── RUG FILTERS ───────────────────────────────────────────────────────────────
-RUG_HARD = {"rugpull", "honeypot", "scam", "ponzi", "exit", "drain"}
-RUG_SOFT = {
-    "elon", "trump", "biden", "musk", "shib", "doge", "pepe", "inu",
-    "safe", "moon", "gem", "100x", "1000x", "rich", "lambo", "presale",
-    "airdrop", "giveaway", "free", "official", "real", "legit", "verified",
-    "guaranteed", "pump", "based", "chad", "wojak", "bonk", "wif", "bome",
-    "catwif", "notcoin", "hamster", "clown", "x100", "x1000", "moonshot",
-    "nextgem", "callout", "fair", "launch", "stealth", "kek", "frog",
-}
-COPYCAT_SYMS = {
-    "BTC", "ETH", "SOL", "BNB", "DOGE", "SHIB", "PEPE", "WIF", "BONK",
-    "TRUMP", "MAGA", "BOME", "WEN", "SAMO", "COPE", "FLOKI", "KISHU",
-}
+# ── RPC ───────────────────────────────────────────────────────────────────────
+def _rpc_url() -> str:
+    qn  = os.getenv("QUICKNODE_RPC", "")
+    hel = os.getenv("HELIUS_API_KEY", "")
+    if qn:  return qn
+    if hel: return f"https://mainnet.helius-rpc.com/?api-key={hel}"
+    return "https://api.mainnet-beta.solana.com"
+
+def _das_url() -> str:
+    """Helius DAS for metadata — best source for token name/symbol."""
+    hel = os.getenv("HELIUS_API_KEY", "")
+    if hel: return f"https://mainnet.helius-rpc.com/?api-key={hel}"
+    return _rpc_url()
+
+async def rpc(method: str, params: list, timeout: int = 6) -> Optional[Dict]:
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.post(_rpc_url(),
+                json={"jsonrpc": "2.0", "id": 1,
+                      "method": method, "params": params},
+                timeout=aiohttp.ClientTimeout(total=timeout)) as r:
+                if r.status == 200:
+                    return (await r.json()).get("result")
+    except Exception as e:
+        logger.debug(f"RPC {method}: {e}")
+    return None
+
+async def das(method: str, params: dict, timeout: int = 6) -> Optional[Dict]:
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.post(_das_url(),
+                json={"jsonrpc": "2.0", "id": 1,
+                      "method": method, "params": params},
+                timeout=aiohttp.ClientTimeout(total=timeout)) as r:
+                if r.status == 200:
+                    return (await r.json()).get("result")
+    except Exception as e:
+        logger.debug(f"DAS {method}: {e}")
+    return None
 
 # ── WATCHLIST ─────────────────────────────────────────────────────────────────
 @dataclass
@@ -103,9 +130,10 @@ class WatchlistEntry:
     risk_flags: List[str]
     snapshots: List[Snapshot] = field(default_factory=list)
 
-watchlist:    Dict[str, WatchlistEntry] = {}
-alert_times:  List[float] = []
+watchlist:     Dict[str, WatchlistEntry] = {}
+alert_times:   List[float] = []
 last_alert_at: float = 0.0
+_startup_slot: int   = 0    # set at boot for freshness gating
 
 def can_alert() -> bool:
     global alert_times, last_alert_at
@@ -138,7 +166,6 @@ async def init_db():
             );
         """)
         await db.commit()
-    # Clear stale seen_tokens so fresh deploys catch recent launches
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "DELETE FROM seen_tokens "
@@ -181,79 +208,46 @@ async def mark_seen(mint: str):
             (mint,))
         await db.commit()
 
-# ── RPC ───────────────────────────────────────────────────────────────────────
-def _rpc_url() -> str:
-    qn  = os.getenv("QUICKNODE_RPC", "")
-    hel = os.getenv("HELIUS_API_KEY", "")
-    if qn:  return qn
-    if hel: return f"https://mainnet.helius-rpc.com/?api-key={hel}"
-    return "https://api.mainnet-beta.solana.com"
-
-async def rpc(method: str, params: list, timeout: int = 6) -> Optional[Dict]:
-    try:
-        async with aiohttp.ClientSession() as s:
-            async with s.post(_rpc_url(),
-                json={"jsonrpc": "2.0", "id": 1,
-                      "method": method, "params": params},
-                timeout=aiohttp.ClientTimeout(total=timeout)) as r:
-                if r.status == 200:
-                    return (await r.json()).get("result")
-    except Exception as e:
-        logger.debug(f"RPC {method}: {e}")
-    return None
-
-async def das(method: str, params: dict, timeout: int = 6) -> Optional[Dict]:
-    hel = os.getenv("HELIUS_API_KEY", "")
-    url = (f"https://mainnet.helius-rpc.com/?api-key={hel}"
-           if hel else _rpc_url())
-    try:
-        async with aiohttp.ClientSession() as s:
-            async with s.post(url,
-                json={"jsonrpc": "2.0", "id": 1,
-                      "method": method, "params": params},
-                timeout=aiohttp.ClientTimeout(total=timeout)) as r:
-                if r.status == 200:
-                    return (await r.json()).get("result")
-    except Exception as e:
-        logger.debug(f"DAS {method}: {e}")
-    return None
-
-# ── METADATA (pump.fun API first, DAS fallback) ────────────────────────────
+# ── METADATA ─────────────────────────────────────────────────────────────────
 async def fetch_token_metadata(mint: str) -> Dict:
+    """Helius DAS first (reliable names), pump.fun API for MC/socials."""
+    # Try Helius DAS getAsset — this is what gave real names in the old version
+    result = await das("getAsset", {"id": mint})
+    meta: Dict = {}
+    if result:
+        content  = result.get("content", {})
+        metadata = content.get("metadata", {})
+        links    = content.get("links", {})
+        meta = {
+            "name":        metadata.get("name", ""),
+            "symbol":      metadata.get("symbol", ""),
+            "description": metadata.get("description", ""),
+            "twitter":     links.get("twitter", ""),
+            "telegram":    links.get("telegram", ""),
+            "website":     links.get("external_url", ""),
+            "usd_market_cap": 0.0,
+        }
+
+    # Enrich with pump.fun API (MC + socials) — best effort, may 403
     try:
         async with aiohttp.ClientSession() as s:
             async with s.get(
                 f"https://frontend-api.pump.fun/coins/{mint}",
-                timeout=aiohttp.ClientTimeout(total=5)) as r:
+                timeout=aiohttp.ClientTimeout(total=4)) as r:
                 if r.status == 200:
                     d = await r.json()
-                    return {
-                        "name":              d.get("name", ""),
-                        "symbol":            d.get("symbol", ""),
-                        "description":       d.get("description", ""),
-                        "twitter":           d.get("twitter", ""),
-                        "telegram":          d.get("telegram", ""),
-                        "website":           d.get("website", ""),
-                        "usd_market_cap":    float(d.get("usd_market_cap") or 0),
-                        "created_timestamp": d.get("created_timestamp"),
-                    }
+                    if not meta.get("name"):
+                        meta["name"]   = d.get("name", "")
+                        meta["symbol"] = d.get("symbol", "")
+                    if not meta.get("twitter"):
+                        meta["twitter"]  = d.get("twitter", "")
+                        meta["telegram"] = d.get("telegram", "")
+                        meta["website"]  = d.get("website", "")
+                    meta["usd_market_cap"] = float(d.get("usd_market_cap") or 0)
     except Exception:
         pass
-    result = await das("getAsset", {"id": mint})
-    if not result:
-        return {}
-    content  = result.get("content", {})
-    metadata = content.get("metadata", {})
-    links    = content.get("links", {})
-    return {
-        "name":          metadata.get("name", ""),
-        "symbol":        metadata.get("symbol", ""),
-        "description":   metadata.get("description", ""),
-        "twitter":       links.get("twitter", ""),
-        "telegram":      links.get("telegram", ""),
-        "website":       links.get("external_url", ""),
-        "usd_market_cap": 0.0,
-    }
+
+    return meta
 
 async def fetch_dev_history(dev_wallet: str) -> Dict:
     async with aiosqlite.connect(DB_PATH) as db:
@@ -307,8 +301,8 @@ async def fetch_dev_history(dev_wallet: str) -> Dict:
     return info
 
 async def fetch_snapshot(mint: str) -> Snapshot:
-    """Original working snapshot — bonding curve % from largest accounts,
-    holder count from top 20 wallets, tx count from signatures."""
+    """Bonding curve % + holder count + tx count via Quicknode RPC.
+    Same logic as the original that produced good callouts."""
     holders_res, sigs_res = await asyncio.gather(
         rpc("getTokenLargestAccounts", [mint, {"commitment": "confirmed"}]),
         rpc("getSignaturesForAddress",  [mint, {"limit": 30, "commitment": "confirmed"}]),
@@ -316,149 +310,82 @@ async def fetch_snapshot(mint: str) -> Snapshot:
     accounts = (holders_res or {}).get("value", [])
     amounts  = []
     for a in accounts:
-        try: amounts.append(float(a.get("uiAmount") or 0))
-        except Exception: pass
+        try:
+            v = a.get("uiAmount")
+            if v is not None:
+                amounts.append(float(v))
+        except Exception:
+            pass
 
     curve_pct = top1_pct = 0.0
     holder_count = len(amounts)
     if amounts:
-        # Largest account = bonding curve contract
-        # curve_pct = how much of the supply has been bought out
-        curve_pct = max(0.0, min(100.0, round((1 - amounts[0] / TOTAL_SUPPLY) * 100, 2)))
+        curve_pct = max(0.0, min(100.0, round(
+            (1 - amounts[0] / TOTAL_SUPPLY) * 100, 2)))
         top1_pct  = round(amounts[0] / TOTAL_SUPPLY * 100, 2)
 
     tx_count = len(sigs_res) if sigs_res else 0
+    logger.info(
+        f"SNAP {mint[:12]} curve={curve_pct:.2f}% "
+        f"h={holder_count} tx={tx_count} top1={top1_pct:.1f}%")
     return Snapshot(
         t=time.time(), curve_pct=curve_pct,
         holder_count=holder_count, top1_pct=top1_pct, tx_count=tx_count,
     )
 
-# ── RUG PRE-FILTER ────────────────────────────────────────────────────────────
+# ── PRE-FILTER ────────────────────────────────────────────────────────────────
 def pre_filter_rug(meta: Dict, dev: Dict) -> Tuple[int, List[str]]:
-    """Momentum-only filter. No dev history, no name filters.
-    Every coin gets a chance — only momentum decides."""
+    """Momentum-only — every coin evaluated on price action, not reputation."""
     return 0, []
 
-# ── CONVICTION GATE ───────────────────────────────────────────────────────────
-# ── CONVICTION SCORING ────────────────────────────────────────────────────────
-# Score 0-100. Coins are ranked by momentum quality, not binary pass/fail.
-# High scores alert immediately. Medium scores need more confirmation.
-# This gives 5-10 trades/hour without spam and without missing fast movers.
-CONVICTION_THRESHOLD_FAST   = 55   # alert immediately on first pass
-CONVICTION_THRESHOLD_SLOW   = 35   # alert after 2 consecutive passes
-_pending_conviction: Dict[str, int] = {}  # mint -> consecutive passes
+# ── CONVICTION GATE — original proven binary gate ─────────────────────────────
+def check_conviction(entry: WatchlistEntry) -> Tuple[bool, Dict]:
+    snaps = entry.snapshots
+    if len(snaps) < 2:
+        return False, {}
 
-def _score_conviction(snaps: list, entry: "WatchlistEntry") -> Tuple[int, Dict]:
-    """Score 0-100 based on momentum signals. Higher = stronger signal."""
-    now_s   = snaps[-1]
-    first   = snaps[0]
-    prev    = snaps[-2]
+    now_s  = snaps[-1]
+    first  = snaps[0]
+    prev   = snaps[-2]
     elapsed = max((now_s.t - first.t) / 60, 0.01)
 
     curve_velocity  = (now_s.curve_pct - first.curve_pct) / elapsed
     holder_velocity = (now_s.holder_count - first.holder_count) / elapsed
     holder_delta    = now_s.holder_count - prev.holder_count
     curve_delta     = now_s.curve_pct - prev.curve_pct
-    age_secs        = round(now_s.t - entry.added_at)
 
     momentum = {
-        "curve_pct":      now_s.curve_pct,
-        "curve_velocity": round(curve_velocity, 3),
-        "curve_delta":    round(curve_delta, 3),
-        "holder_count":   now_s.holder_count,
-        "holder_velocity":round(holder_velocity, 2),
-        "holder_delta":   holder_delta,
-        "top1_pct":       now_s.top1_pct,
-        "tx_count":       now_s.tx_count,
-        "age_secs":       age_secs,
+        "curve_pct":       now_s.curve_pct,
+        "curve_velocity":  round(curve_velocity, 3),
+        "curve_delta":     round(curve_delta, 3),
+        "holder_count":    now_s.holder_count,
+        "holder_velocity": round(holder_velocity, 2),
+        "holder_delta":    holder_delta,
+        "top1_pct":        now_s.top1_pct,
+        "tx_count":        now_s.tx_count,
+        "age_secs":        round(now_s.t - entry.added_at),
     }
 
-    score = 0
+    # ── Original proven gates ─────────────────────────────────────────────
+    if curve_velocity  < MIN_CURVE_VELOCITY: return False, momentum
+    if now_s.holder_count < MIN_HOLDERS:     return False, momentum
+    if holder_delta    < MIN_HOLDER_DELTA:   return False, momentum
+    if now_s.top1_pct  > MAX_TOP1_PCT:      return False, momentum
+    if now_s.curve_pct < 1.0:               return False, momentum
+    # Two consecutive positive windows — filters noise
+    if len(snaps) >= 3:
+        delta2 = prev.curve_pct - snaps[-3].curve_pct
+        if curve_delta <= 0 and delta2 <= 0:
+            return False, momentum
 
-    # ── 1. Bonding curve fill % (0-25 pts) ───────────────────────────────
-    # Real curve_pct from getTokenLargestAccounts — original working signal
-    cp = now_s.curve_pct
-    if   cp >= 10: score += 25
-    elif cp >= 5:  score += 20
-    elif cp >= 2:  score += 15
-    elif cp >= 1:  score += 10
-    elif cp >= 0.5: score += 5
-
-    # ── 2. Curve velocity (0-25 pts) ──────────────────────────────────────
-    # Rate of curve fill per minute — the original conviction signal
-    cv = curve_velocity
-    if   cv >= 2.0: score += 25
-    elif cv >= 1.0: score += 20
-    elif cv >= 0.5: score += 15
-    elif cv >= 0.3: score += 10
-    elif cv >= 0.1: score += 5
-
-    # ── 3. Holder count + growth (0-25 pts) ───────────────────────────────
-    hc = now_s.holder_count
-    hd = holder_delta
-    if   hc >= 15 and hd >= 3: score += 25
-    elif hc >= 10 and hd >= 2: score += 20
-    elif hc >= 7  and hd >= 2: score += 15
-    elif hc >= 5  and hd >= 1: score += 10
-    elif hc >= 3  and hd >= 1: score += 5
-
-    # ── 4. Top wallet concentration (0-15 pts) ────────────────────────────
-    # top1_pct here is the bonding curve % — lower = more bought out
-    t1 = now_s.top1_pct
-    if   t1 <= 85:  score += 15   # curve >15% filled
-    elif t1 <= 90:  score += 10
-    elif t1 <= 95:  score += 5
-    # >95% = barely any buys = low score
-
-    # ── 5. Tx count (0-10 pts) ────────────────────────────────────────────
-    tx = now_s.tx_count
-    if   tx >= 20: score += 10
-    elif tx >= 10: score += 7
-    elif tx >= 5:  score += 4
-
-    # ── Hard floors ───────────────────────────────────────────────────────
-    if curve_velocity <= 0:      score = min(score, 15)
-    if now_s.curve_pct < 0.5:   score = min(score, 20)
-    if holder_delta    < 0:      score = min(score, 10)
-
-    return min(score, 100), momentum
-
-
-def check_conviction(entry: WatchlistEntry) -> Tuple[bool, Dict]:
-    global _pending_conviction
-    snaps = entry.snapshots
-    if len(snaps) < 2:
-        return False, {}
-
-    score, momentum = _score_conviction(snaps, entry)
-    momentum["conviction_score"] = score
-
-    mint = entry.mint
-
-    # Fast path — high confidence, alert immediately
-    if score >= CONVICTION_THRESHOLD_FAST:
-        _pending_conviction.pop(mint, None)
-        return True, momentum
-
-    # Medium path — needs 2 consecutive passes to confirm
-    if score >= CONVICTION_THRESHOLD_SLOW:
-        passes = _pending_conviction.get(mint, 0) + 1
-        _pending_conviction[mint] = passes
-        if passes >= 2:
-            _pending_conviction.pop(mint, None)
-            return True, momentum
-        return False, momentum
-
-    # Below threshold — reset any pending confirmation
-    _pending_conviction.pop(mint, None)
-    return False, momentum
+    return True, momentum
 
 # ── WATCHLIST LOOP ────────────────────────────────────────────────────────────
 async def watchlist_loop():
     logger.info("Watchlist engine started")
     while True:
         await asyncio.sleep(CHECK_INTERVAL)
-        now = time.time()
+        now    = time.time()
         to_drop = []
         for mint, entry in list(watchlist.items()):
             age = now - entry.added_at
@@ -469,6 +396,7 @@ async def watchlist_loop():
                 entry.snapshots.append(snap)
             except Exception as e:
                 logger.debug(f"Snapshot {mint[:12]}: {e}"); continue
+            # Early cull — no activity after 90 seconds
             if age > 90 and snap.curve_pct < 0.5 and snap.holder_count < 8:
                 to_drop.append(mint); continue
             passed, momentum = check_conviction(entry)
@@ -502,7 +430,7 @@ async def fire_alert(entry: WatchlistEntry, momentum: Dict):
     mint = entry.mint
     dev  = entry.dev
 
-    # Refresh metadata at alert time for latest MC + name
+    # Refresh metadata at alert time for latest MC
     fresh = await fetch_token_metadata(mint)
     meta  = {**entry.meta, **fresh} if fresh.get("name") else entry.meta
 
@@ -530,24 +458,20 @@ async def fire_alert(entry: WatchlistEntry, momentum: Dict):
     txn = momentum.get("tx_count", 0)
 
     text = (
-        f"😈 *𝐂𝐋𝐄𝐗 𝐂𝐀𝐋𝐋𝐎𝐔𝐓*\n\n"
-        f"🪙 *{name}* (${symbol})\n"
+        f"👁 *CLEX CALLOUT*\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"*{name}* · ${symbol}\n"
         f"`{mint}`\n"
         f"💰 MC: *{mc_str}* · ⏱ *{age_str} old*\n\n"
         f"📈 *MOMENTUM*\n"
         f"Curve:    {cp:.1f}%  {_bar(cp)}  (+{momentum.get('curve_delta',0):.2f}%)\n"
         f"Velocity: {cv:.2f}%/min  {_bar(cv, 3)}\n"
-        f"Holders:  {hc}  (+{momentum.get('holder_delta',0)} last window)\n"
-        f"H-rate:   {hv:.1f}/min · Top1: {t1:.1f}% · Txns: {txn}\n\n"
-        f"⚠️ *RISK* (score: {entry.rug_risk}/100)\n"
-        f"{risk_block}\n\n"
-        f"👨‍💻 *DEV* `{entry.dev_wallet[:20]}...`\n"
-        f"Age: {dev.get('wallet_age_days',0)}d · "
-        f"Tokens: {dev.get('tokens_created',0)} · "
-        f"Rugs: {dev.get('prior_rugs_est',0)}\n\n"
+        f"Holders:  {hc}  (+{momentum.get('holder_delta',0)} this window)\n"
+        f"H-rate:   {hv:.1f}/min · Txns: {txn}\n\n"
+        f"👨‍💻 DEV `{entry.dev_wallet[:20]}...`\n\n"
         f"🔗 [Pump.fun](https://pump.fun/{mint}) · "
-        f"[Solscan](https://solscan.io/tx/{sig}) · "
-        f"[GMGN](https://gmgn.ai/sol/token/{mint})\n"
+        f"[GMGN](https://gmgn.ai/sol/token/{mint}) · "
+        f"[Solscan](https://solscan.io/tx/{sig})\n"
         f"Socials: {social_line}"
     )
 
@@ -566,10 +490,14 @@ async def fire_alert(entry: WatchlistEntry, momentum: Dict):
         if not await is_subscriber(uid): continue
         asyncio.create_task(_run_snipe(uid, mint, name, symbol, momentum, su))
 
-    logger.info(f"ALERT {name} ({mint[:12]}) score={score}/100 MC={mc_str} age={age_str} vel={cv:.2f}/min")
+    logger.info(
+        f"ALERT {name} ({mint[:12]}) MC={mc_str} "
+        f"age={age_str} curve={cp:.1f}% vel={cv:.2f}%/min"
+    )
 
 async def _run_snipe(user_id: int, mint: str, name: str,
                      symbol: str, momentum: Dict, su: Dict):
+    """Calls new execute_user_buy which takes momentum dict."""
     ok, sig, method, buy_sol, exit_mode = await execute_user_buy(
         user_id, mint, name, symbol, momentum)
     profile    = RISK_PROFILES[su["risk_profile"]]
@@ -601,41 +529,39 @@ def _extract_launch(tx: Dict) -> Optional[Tuple[str, str]]:
         if mint.endswith("pump"): return mint, dev
     return None
 
-MAX_COIN_AGE_SECS = 120  # reject coins older than 2 minutes
-
 async def process_payload(payload: list):
+    global _startup_slot
     if not isinstance(payload, list): return
     for tx in payload:
+        # ── Slot-based freshness gate ─────────────────────────────────────
+        # Quicknode stream delivers backfill on reconnect.
+        # Any transaction with a slot older than startup gets dropped.
+        tx_slot = tx.get("slot", 0)
+        if _startup_slot > 0 and tx_slot > 0:
+            if tx_slot < (_startup_slot - MAX_COIN_AGE_SLOTS):
+                continue  # stale block from backfill
+
         result = _extract_launch(tx)
         if not result: continue
         mint, dev_wallet = result
         if mint in watchlist or await already_seen(mint): continue
-
-        # ── Freshness gate using pump.fun API timestamp ───────────────────
-        meta = await fetch_token_metadata(mint)
-        created = meta.get("created_timestamp")
-        age_secs = 0
-        if created:
-            ts = float(created)
-            # Handle milliseconds — pump.fun sometimes returns ms
-            if ts > 1e12:
-                ts = ts / 1000.0
-            age_secs = time.time() - ts
-            if age_secs > MAX_COIN_AGE_SECS:
-                logger.debug(f"Stale {mint[:12]} age={age_secs:.0f}s — dropped")
-                await mark_seen(mint)
-                continue
-        # If no timestamp, allow it through — better to scan than miss
-
         await mark_seen(mint)
-        dev = {}  # dev history not used — momentum-only strategy
-        rug_risk, risk_flags = 0, []
 
+        # Fetch metadata and dev history in parallel
+        meta, dev = await asyncio.gather(
+            fetch_token_metadata(mint),
+            fetch_dev_history(dev_wallet),
+        )
+
+        rug_risk, risk_flags = pre_filter_rug(meta, dev)
+
+        # Record first buyers for blacklist (fire and forget, limit 5)
         for acct in list(tx.get("accountData", []))[:5]:
             addr = acct.get("account", "")
             if addr and addr != dev_wallet:
                 asyncio.create_task(record_first_buyer(addr))
 
+        # Cap watchlist to control RPC usage
         if len(watchlist) >= 50:
             oldest = min(watchlist, key=lambda m: watchlist[m].added_at)
             watchlist.pop(oldest, None)
@@ -647,7 +573,7 @@ async def process_payload(payload: list):
             added_at=time.time(), meta=meta, dev=dev,
             rug_risk=rug_risk, risk_flags=risk_flags,
         )
-        logger.info(f"Watchlist +{name} ({mint[:12]}) age={int(age_secs)}s rug={rug_risk}")
+        logger.info(f"Watchlist +{name} ({mint[:12]}) slot={tx_slot}")
 
 # ── KEYBOARDS ─────────────────────────────────────────────────────────────────
 def _kb_main(subscribed: bool) -> InlineKeyboardMarkup:
@@ -692,16 +618,15 @@ def _kb_risk(prefix: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="⬅️ Back", callback_data="sniper_menu")],
     ])
 
-# ── STATE ─────────────────────────────────────────────────────────────────────
-_input_state: Dict[int, str] = {}   # "custom_amount" | absent
-_sell_pending: Dict[int, int] = {}  # user_id → pos_id
+_input_state:  Dict[int, str] = {}
+_sell_pending: Dict[int, int] = {}
 
 WELCOME = (
-    "😈 *𝕎𝕖𝕝𝕔𝕠𝕞𝕖 𝕥𝕠 ℂ𝕃𝔼𝕏, 𝕙𝕦𝕞𝕒𝕟.*\n\n"
-    "Every new launch enters a watchlist.\n"
-    "Alerts only fire when momentum is *proven* — rising curve, "
-    "growing holders, sustained buying.\n\n"
-    "No spam. Only callouts worth trading."
+    "👁 *CLEX — Real-Time Pump Intelligence*\n\n"
+    "Every pump.fun launch is tracked from birth.\n"
+    "Callouts only fire when momentum is *confirmed* — "
+    "rising curve, accelerating holders, sustained buy pressure.\n\n"
+    "High signal. No noise. Early entries only."
 )
 
 # ── HANDLERS ──────────────────────────────────────────────────────────────────
@@ -716,14 +641,14 @@ async def cb_sub(q: CallbackQuery):
     await add_subscriber(q.from_user.id)
     await q.answer("✅ Subscribed!")
     await q.message.edit_text(
-        "✅ *Subscribed!*\n\nAlerts will arrive when CLEX confirms a coin is rising.",
+        "✅ *Subscribed.*\n\nCallouts arrive the moment conviction is confirmed.",
         reply_markup=_kb_main(True), parse_mode=ParseMode.MARKDOWN)
 
 @router.callback_query(F.data == "unsub")
 async def cb_unsub(q: CallbackQuery):
     await remove_subscriber(q.from_user.id)
     await q.answer("🔕 Unsubscribed")
-    await q.message.edit_text("🔕 Unsubscribed. /start to re-subscribe.",
+    await q.message.edit_text("🔕 Unsubscribed. /start to return.",
                                reply_markup=_kb_main(False))
 
 @router.callback_query(F.data == "back")
@@ -735,18 +660,17 @@ async def cb_back(q: CallbackQuery):
 @router.callback_query(F.data == "wl")
 async def cb_wl(q: CallbackQuery):
     if not watchlist:
-        await q.answer("Watchlist is empty right now"); return
+        await q.answer("Watchlist is empty"); return
     now   = time.time()
     lines = []
     for mint, entry in list(watchlist.items())[:10]:
         age  = int(now - entry.added_at)
         snap = entry.snapshots[-1] if entry.snapshots else None
         name = entry.meta.get("name") or mint[:8]
-        lines.append(
-            f"• {name[:16]} | {age}s | "
-            f"curve:{snap.curve_pct:.1f}% | "
-            f"h:{snap.holder_count}" if snap else
-            f"• {name[:16]} | {age}s | —")
+        if snap:
+            lines.append(f"• {name[:16]} | {age}s | curve:{snap.curve_pct:.1f}% | h:{snap.holder_count}")
+        else:
+            lines.append(f"• {name[:16]} | {age}s | —")
     await q.answer()
     await q.message.edit_text(
         f"*Watchlist ({len(watchlist)} coins)*\n\n" + "\n".join(lines),
@@ -757,14 +681,14 @@ async def cb_wl(q: CallbackQuery):
 @router.callback_query(F.data == "help")
 async def cb_help(q: CallbackQuery):
     await q.message.edit_text(
-        "🔬 *How CLEX works*\n\n"
-        "Every pump.fun launch enters the watchlist.\n"
-        "Every 15s CLEX checks:\n\n"
-        "• Curve velocity ≥ 0.4%/min\n"
-        "• Holders ≥ 12 and growing\n"
-        "• Top wallet < 50%\n"
+        "🔬 *How CLEX Works*\n\n"
+        "Every pump.fun launch is detected at the moment of creation.\n\n"
+        "Every 15 seconds, each coin is scored on:\n\n"
+        "• Bonding curve velocity ≥ 0.4%/min\n"
+        "• Holder count ≥ 12 and growing by ≥ 2\n"
+        "• Top wallet concentration < 50%\n"
         "• Two consecutive positive windows\n\n"
-        "Coins that don't prove themselves within 5 min are dropped silently.",
+        "Coins that fail to prove momentum within 5 minutes are dropped silently.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="⬅️ Back", callback_data="back")]]),
         parse_mode=ParseMode.MARKDOWN)
@@ -785,7 +709,7 @@ async def cmd_stats(m: Message):
         f"Subscribers: {subs}\n"
         f"Tokens scanned: {seen}\n"
         f"Active snipers: {snip}\n"
-        f"Watchlist now: {len(watchlist)}\n"
+        f"Watchlist: {len(watchlist)}\n"
         f"Alerts last hour: {recent}/{MAX_ALERTS_PER_HOUR}\n"
         f"Blacklisted wallets: {await get_blacklist_count()}",
         parse_mode=ParseMode.MARKDOWN)
@@ -796,7 +720,7 @@ async def cmd_performance(m: Message):
     if not stats:
         await m.answer("No closed trades yet."); return
     lines = [
-        f"{'🟢' if r['pnl']>=0 else '🔴'} {r['name']} (${r['symbol']}) "
+        f"{'🟢' if r['pnl']>=0 else '🔴'} {r['name']} "
         f"{r['pnl']:+.4f} SOL ({r['pct']:+.1f}%) [{r['reason']}]"
         for r in stats.get("recent", [])
     ]
@@ -826,14 +750,14 @@ async def cmd_sell(m: Message):
             f"🔫 *Manual Sell*\n\n"
             f"*{pos['name']}* (${pos['symbol']})\n"
             f"Value: {val:.4f} SOL ({pnl_pct:+.1f}%)\n\n"
-            f"Reply /sellconfirm to exit.",
+            f"Confirm with /sellconfirm",
             parse_mode=ParseMode.MARKDOWN)
         _sell_pending[uid] = pos["id"]
     else:
         lines = [f"{i+1}. *{p['name']}* — {p['sol_spent']} SOL"
                  for i, p in enumerate(positions)]
-        await m.answer("Positions:\n\n" + "\n".join(lines) +
-                       "\n\n/sell <number>", parse_mode=ParseMode.MARKDOWN)
+        await m.answer("Open positions:\n\n" + "\n".join(lines),
+                       parse_mode=ParseMode.MARKDOWN)
 
 @router.message(Command("sellconfirm"))
 async def cmd_sellconfirm(m: Message):
@@ -845,7 +769,7 @@ async def cmd_sellconfirm(m: Message):
     ok, sig, pnl_sol, pnl_pct = await execute_manual_sell(uid, pos_id)
     if ok:
         await m.answer(
-            f"✅ *Sold!*\nPnL: {pnl_sol:+.4f} SOL ({pnl_pct:+.1f}%)\n"
+            f"✅ *Sold*\nPnL: {pnl_sol:+.4f} SOL ({pnl_pct:+.1f}%)\n"
             f"`{sig[:20]}...`", parse_mode=ParseMode.MARKDOWN)
     else:
         await m.answer(f"❌ Sell failed: {sig}")
@@ -855,14 +779,15 @@ async def cmd_sellconfirm(m: Message):
 async def cb_sniper_menu(q: CallbackQuery):
     uid = q.from_user.id
     if not await is_subscriber(uid):
-        await q.answer("Subscribe first!", show_alert=True); return
+        await q.answer("Subscribe first.", show_alert=True); return
     user = await get_sniper_user(uid)
     await q.answer()
     if not user:
         await q.message.edit_text(
             "🔫 *CLEX Sniper*\n\n"
-            "Auto-buys every callout the moment it fires.\n\n"
-            "Connect a dedicated Solana wallet — key is AES-256 encrypted.",
+            "Executes on every confirmed callout the moment it fires.\n\n"
+            "Connect a dedicated trading wallet. "
+            "Your private key is AES-256 encrypted and never leaves the system.",
             reply_markup=_kb_sniper(None), parse_mode=ParseMode.MARKDOWN)
         return
     profile     = RISK_PROFILES[user["risk_profile"]]
@@ -1005,7 +930,7 @@ async def cb_delete_confirm(q: CallbackQuery):
     await q.message.edit_text(
         "🗑 *Delete Wallet*\n\n"
         "Permanently removes your private key.\n"
-        "Open positions will *not* be auto-sold.\n\nSure?",
+        "Open positions will *not* be auto-sold.\n\nConfirm?",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="✅ Yes, Delete",
                                   callback_data="sniper_delete_go"),
@@ -1029,14 +954,13 @@ async def handle_message(m: Message):
     istate = _input_state.get(uid)
     state  = await get_setup_state(uid)
 
-    # Custom amount input
     if istate == "custom_amount":
         raw = (m.text or "").strip()
         try:
             amount = float(raw)
             if amount <= 0: raise ValueError
         except ValueError:
-            await m.answer("❌ Invalid. Send a number like `0.05`"); return
+            await m.answer("❌ Send a number like `0.05`"); return
         user    = await get_sniper_user(uid)
         profile = RISK_PROFILES[user["risk_profile"]]
         bal     = await get_sol_balance(user["pubkey"])
@@ -1054,7 +978,6 @@ async def handle_message(m: Message):
                                       callback_data="sniper_menu")]]))
         return
 
-    # Private key input
     if not state or state["step"] != "key": return
     raw_key = (m.text or "").strip()
     try: await bot.delete_message(m.chat.id, m.message_id)
@@ -1075,11 +998,11 @@ async def handle_message(m: Message):
     await save_sniper_user(uid, raw_key, pubkey, risk)
     await clear_setup_state(uid)
     await bot.send_message(uid,
-        f"✅ *Wallet connected!*\n\n"
+        f"✅ *Wallet connected*\n\n"
         f"Address: `{pubkey[:20]}...`\n"
         f"Balance: {bal} SOL\n\n"
         f"Profile: {profile['label']}\n{profile['desc']}\n\n"
-        f"Sniper is *OFF* — toggle on from the menu when ready.",
+        f"Sniper is *OFF* by default — enable it from the menu when ready.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🔫 Sniper Menu",
                                   callback_data="sniper_menu")]]),
@@ -1088,17 +1011,25 @@ async def handle_message(m: Message):
 # ── FASTAPI ───────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global _startup_slot
     await init_db()
     await init_sniper_db()
     set_alert_callback(sniper_message_callback)
     await bot.delete_webhook(drop_pending_updates=True)
+
+    # Capture startup slot for freshness gating
+    slot_result = await rpc("getSlot", [])
+    if slot_result:
+        _startup_slot = int(slot_result)
+        logger.info(f"Startup slot: {_startup_slot} — freshness gate active")
+
     await asyncio.sleep(2)
     logger.info("CLEX ready — Quicknode stream active")
     asyncio.create_task(watchlist_loop())
     asyncio.create_task(position_monitor_loop())
     poll = asyncio.create_task(
         dp.start_polling(bot, allowed_updates=["message", "callback_query"]))
-    logger.info("Bot polling started")
+    logger.info("Bot polling · watchlist engine · position monitor — all running")
     yield
     poll.cancel()
     try:
@@ -1116,7 +1047,8 @@ async def webhook(req: Request):
 
 @app.get("/")
 async def health():
-    return {"status": "alive", "watchlist": len(watchlist)}
+    return {"status": "alive", "watchlist": len(watchlist),
+            "startup_slot": _startup_slot}
 
 if __name__ == "__main__":
     import uvicorn
