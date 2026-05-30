@@ -810,8 +810,10 @@ async def position_monitor_loop():
                     ok, sig, pnl, pct_ = await execute_full_sell(pos, "rug")
                     if ok:
                         await _notify(uid,
-                            f"🚨 *RUG — Emergency Exit*\n*{name}* (${symbol})\n"
-                            f"PnL: {pnl:+.4f} SOL ({pct_:.1f}%)\n`{sig[:20]}...`")
+                            f"🚨 *Emergency Exit — Rug Detected*\n"
+                            f"*{name}* (${symbol}) · Position closed immediately\n"
+                            f"PnL: {pnl:+.4f} SOL ({pct_:.1f}%)\n"
+                            f"`{sig[:20]}...`")
                     _prev_values.pop(pos["id"], None)
                     continue
                 _prev_values[pos["id"]] = cur_val
@@ -825,31 +827,35 @@ async def position_monitor_loop():
                         ok, sig, out = await execute_partial_sell(pos, t1_pct, 1)
                         if ok:
                             await _notify(uid,
-                                f"🟢 *T1 Exit {profile['tiered_t1_mult']}x — {int(t1_pct*100)}% sold*\n"
-                                f"*{name}* +{out:.4f} SOL secured\n"
-                                f"Trailing rest · `{sig[:20]}...`")
+                                f"🟢 *Tier 1 Target Hit — {profile['tiered_t1_mult']}x*\n"
+                                f"*{name}* · {int(t1_pct*100)}% sold · +{out:.4f} SOL locked\n"
+                                f"Trailing the remainder · `{sig[:20]}...`")
                         exited = True
                     elif pos["tier1_sold"] and not pos["tier2_sold"] and ratio >= profile["tiered_t2_mult"]:
                         ok, sig, out = await execute_partial_sell(pos, t2_pct / (1 - t1_pct), 2)
                         if ok:
                             await _notify(uid,
-                                f"🚀 *T2 Exit {profile['tiered_t2_mult']}x — more profit locked*\n"
-                                f"*{name}* +{out:.4f} SOL\n"
-                                f"Trailing last slice · `{sig[:20]}...`")
+                                f"🚀 *Tier 2 Target Hit — {profile['tiered_t2_mult']}x*\n"
+                                f"*{name}* · Additional {out:.4f} SOL secured\n"
+                                f"Final slice trailing · `{sig[:20]}...`")
                         exited = True
                     elif pos["tier2_sold"] and cur_val <= trail_stop:
                         ok, sig, pnl, pct_ = await execute_full_sell(pos, "tp")
                         if ok:
                             await _notify(uid,
-                                f"🏁 *Trail Exit — Full Close*\n*{name}* peak {peak_ratio:.2f}x\n"
-                                f"PnL: {pnl:+.4f} SOL ({pct_:.1f}%)\n`{sig[:20]}...`")
+                                f"🏁 *Position Closed — Trail Stop*\n"
+                                f"*{name}* · Peak {peak_ratio:.2f}x\n"
+                                f"PnL: {pnl:+.4f} SOL ({pct_:.1f}%)\n"
+                                f"`{sig[:20]}...`")
                         exited = True
                     elif not pos["tier1_sold"] and cur_val <= trail_stop:
                         ok, sig, pnl, pct_ = await execute_full_sell(pos, "sl")
                         if ok:
                             await _notify(uid,
-                                f"🔴 *Stop Loss*\n*{name}*\n"
-                                f"PnL: {pnl:.4f} SOL ({pct_:.1f}%)\n`{sig[:20]}...`")
+                                f"🔴 *Stop Loss Triggered*\n"
+                                f"*{name}* · Position exited to protect capital\n"
+                                f"PnL: {pnl:.4f} SOL ({pct_:.1f}%)\n"
+                                f"`{sig[:20]}...`")
                         exited = True
 
                 elif exit_mode == "steady":
@@ -857,16 +863,19 @@ async def position_monitor_loop():
                         ok, sig, pnl, pct_ = await execute_full_sell(pos, "tp")
                         if ok:
                             await _notify(uid,
-                                f"{'🟢' if pnl>=0 else '🔴'} *Trail Exit*\n"
-                                f"*{name}* peak {peak_ratio:.2f}x → {ratio:.2f}x\n"
-                                f"PnL: {pnl:+.4f} SOL ({pct_:.1f}%)\n`{sig[:20]}...`")
+                                f"{'🟢' if pnl>=0 else '🔴'} *Trail Stop Exit*\n"
+                                f"*{name}* · Peak {peak_ratio:.2f}x → Closed {ratio:.2f}x\n"
+                                f"PnL: {pnl:+.4f} SOL ({pct_:.1f}%)\n"
+                                f"`{sig[:20]}...`")
                         exited = True
                     elif ratio <= (1 - profile["trailing_stop_pct"] - 0.05):
                         ok, sig, pnl, pct_ = await execute_full_sell(pos, "sl")
                         if ok:
                             await _notify(uid,
-                                f"🔴 *Stop Loss*\n*{name}*\n"
-                                f"PnL: {pnl:.4f} SOL ({pct_:.1f}%)\n`{sig[:20]}...`")
+                                f"🔴 *Stop Loss Triggered*\n"
+                                f"*{name}* · Position exited to protect capital\n"
+                                f"PnL: {pnl:.4f} SOL ({pct_:.1f}%)\n"
+                                f"`{sig[:20]}...`")
                         exited = True
 
                 elif exit_mode == "weak":
@@ -874,23 +883,29 @@ async def position_monitor_loop():
                         ok, sig, pnl, pct_ = await execute_full_sell(pos, "tp")
                         if ok:
                             await _notify(uid,
-                                f"🟢 *Take Profit*\n*{name}*\n"
-                                f"PnL: {pnl:+.4f} SOL ({pct_:.1f}%)\n`{sig[:20]}...`")
+                                f"🟢 *Take Profit Hit*\n"
+                                f"*{name}* · Target reached\n"
+                                f"PnL: {pnl:+.4f} SOL ({pct_:.1f}%)\n"
+                                f"`{sig[:20]}...`")
                         exited = True
                     elif ratio <= profile["fixed_sl"]:
                         ok, sig, pnl, pct_ = await execute_full_sell(pos, "sl")
                         if ok:
                             await _notify(uid,
-                                f"🔴 *Stop Loss*\n*{name}*\n"
-                                f"PnL: {pnl:.4f} SOL ({pct_:.1f}%)\n`{sig[:20]}...`")
+                                f"🔴 *Stop Loss Triggered*\n"
+                                f"*{name}* · Position exited to protect capital\n"
+                                f"PnL: {pnl:.4f} SOL ({pct_:.1f}%)\n"
+                                f"`{sig[:20]}...`")
                         exited = True
 
                 if not exited and age_mins >= profile["time_decay_mins"] and ratio < 1.2:
                     ok, sig, pnl, pct_ = await execute_full_sell(pos, "time_decay")
                     if ok:
                         await _notify(uid,
-                            f"⏱ *Time Decay Exit*\n*{name}* held {age_mins}m\n"
-                            f"PnL: {pnl:+.4f} SOL ({pct_:.1f}%)\n`{sig[:20]}...`")
+                            f"⏱ *Time Decay Exit*\n"
+                            f"*{name}* · No momentum after {age_mins}m — capital recycled\n"
+                            f"PnL: {pnl:+.4f} SOL ({pct_:.1f}%)\n"
+                            f"`{sig[:20]}...`")
                     exited = True
 
                 if exited:
@@ -903,9 +918,9 @@ async def position_monitor_loop():
                     mode_label = {"momentum": "🔥 Momentum", "steady": "📈 Steady",
                                   "weak": "💤 Weak"}.get(exit_mode, exit_mode)
                     await _notify(uid,
-                        f"{_pnl_emoji(pnl_pct)} *{name}* (${symbol})\n"
-                        f"Value: {cur_val:.4f} SOL ({pnl_pct:+.1f}%)\n"
-                        f"Peak: {peak_ratio:.2f}x · Age: {age_mins}m · {mode_label}")
+                        f"{_pnl_emoji(pnl_pct)} *{name}* (${symbol}) — Live Update\n"
+                        f"Current: {cur_val:.4f} SOL  ({pnl_pct:+.1f}%)\n"
+                        f"Peak: {peak_ratio:.2f}x · Held: {age_mins}m · {mode_label}")
                     await update_last_notified(pos["id"])
 
         except Exception as e:
