@@ -42,7 +42,7 @@ DB_PATH        = "clex.db"
 
 # ── TUNING ────────────────────────────────────────────────────────────────────
 WATCHLIST_TTL       = 300        # seconds a coin stays in watchlist
-CHECK_INTERVAL      = 15         # watchlist evaluation interval
+CHECK_INTERVAL      = 30         # watchlist evaluation interval
 MAX_ALERTS_PER_HOUR = 5
 MIN_ALERT_GAP       = 180        # seconds between alerts
 MAX_RUG_SCORE       = int(os.getenv("MAX_RUG_SCORE", "55"))
@@ -228,13 +228,14 @@ async def fetch_token_metadata(mint: str) -> Dict:
                 if r.status == 200:
                     d = await r.json()
                     return {
-                        "name":          d.get("name", ""),
-                        "symbol":        d.get("symbol", ""),
-                        "description":   d.get("description", ""),
-                        "twitter":       d.get("twitter", ""),
-                        "telegram":      d.get("telegram", ""),
-                        "website":       d.get("website", ""),
-                        "usd_market_cap": float(d.get("usd_market_cap") or 0),
+                        "name":              d.get("name", ""),
+                        "symbol":            d.get("symbol", ""),
+                        "description":       d.get("description", ""),
+                        "twitter":           d.get("twitter", ""),
+                        "telegram":          d.get("telegram", ""),
+                        "website":           d.get("website", ""),
+                        "usd_market_cap":    float(d.get("usd_market_cap") or 0),
+                        "created_timestamp": d.get("created_timestamp"),
                     }
     except Exception:
         pass
@@ -549,6 +550,28 @@ def _extract_launch(tx: Dict) -> Optional[Tuple[str, str]]:
         if mint.endswith("pump"): return mint, dev
     return None
 
+# Track current slot for freshness gating
+_current_slot: int = 0
+_slot_updated_at: float = 0.0
+
+async def _get_current_slot() -> int:
+    global _current_slot, _slot_updated_at
+    if time.time() - _slot_updated_at < 10:
+        return _current_slot
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.post(_rpc_url(),
+                json={"jsonrpc":"2.0","id":1,"method":"getSlot","params":[]},
+                timeout=aiohttp.ClientTimeout(total=4)) as r:
+                data = await r.json()
+                _current_slot = data.get("result", 0)
+                _slot_updated_at = time.time()
+    except Exception:
+        pass
+    return _current_slot
+
+MAX_COIN_AGE_SECS = 120  # drop anything older than 2 minutes
+
 async def process_payload(payload: list):
     if not isinstance(payload, list): return
     for tx in payload:
@@ -556,18 +579,21 @@ async def process_payload(payload: list):
         if not result: continue
         mint, dev_wallet = result
         if mint in watchlist or await already_seen(mint): continue
+
+        # Freshness gate — fetch pump.fun metadata and check creation time
+        # before doing anything else. This is the most reliable age check.
+        meta = await fetch_token_metadata(mint)
+        created = meta.get("created_timestamp")  # unix seconds from pump.fun API
+        if created:
+            age = time.time() - float(created)
+            if age > MAX_COIN_AGE_SECS:
+                logger.debug(f"Stale coin {mint[:12]} age={age:.0f}s — skipped")
+                await mark_seen(mint)  # mark so we don't reprocess
+                continue
+
         await mark_seen(mint)
-
-        meta, dev, fp = await asyncio.gather(
-            fetch_token_metadata(mint),
-            fetch_dev_history(dev_wallet),
-            fingerprint_dev_wallet(dev_wallet),
-        )
-
+        dev = await fetch_dev_history(dev_wallet)
         rug_risk, risk_flags = pre_filter_rug(meta, dev)
-        if fp.get("single_funder"):
-            rug_risk = min(rug_risk + 20, 100)
-            risk_flags.append(fp["flag"])
         if rug_risk >= 85:
             logger.debug(f"Discard {mint[:12]} rug={rug_risk}"); continue
 
@@ -578,6 +604,10 @@ async def process_payload(payload: list):
                 asyncio.create_task(record_first_buyer(addr))
 
         name = meta.get("name") or mint[:8]
+        if len(watchlist) >= 50:
+            # Drop oldest entry to cap memory and RPC usage
+            oldest = min(watchlist, key=lambda m: watchlist[m].added_at)
+            watchlist.pop(oldest, None)
         watchlist[mint] = WatchlistEntry(
             mint=mint, dev_wallet=dev_wallet,
             tx_sig=tx.get("signature", ""),
