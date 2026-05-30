@@ -325,7 +325,7 @@ async def fetch_snapshot(mint: str) -> Snapshot:
         top1_pct  = round(amounts[0] / TOTAL_SUPPLY * 100, 2)
 
     tx_count = len(sigs_res) if sigs_res else 0
-    logger.info(
+    logger.warning(
         f"SNAP {mint[:12]} curve={curve_pct:.2f}% "
         f"h={holder_count} tx={tx_count} top1={top1_pct:.1f}%")
     return Snapshot(
@@ -367,17 +367,23 @@ def check_conviction(entry: WatchlistEntry) -> Tuple[bool, Dict]:
     }
 
     # ── Original proven gates ─────────────────────────────────────────────
-    if curve_velocity  < MIN_CURVE_VELOCITY: return False, momentum
-    if now_s.holder_count < MIN_HOLDERS:     return False, momentum
-    if holder_delta    < MIN_HOLDER_DELTA:   return False, momentum
-    if now_s.top1_pct  > MAX_TOP1_PCT:      return False, momentum
-    if now_s.curve_pct < 1.0:               return False, momentum
-    # Two consecutive positive windows — filters noise
+    m = entry.mint[:12]
+    if curve_velocity  < MIN_CURVE_VELOCITY:
+        logger.warning(f"FAIL {m} cv={round(curve_velocity,3)} < {MIN_CURVE_VELOCITY}"); return False, momentum
+    if now_s.holder_count < MIN_HOLDERS:
+        logger.warning(f"FAIL {m} holders={now_s.holder_count} < {MIN_HOLDERS}"); return False, momentum
+    if holder_delta    < MIN_HOLDER_DELTA:
+        logger.warning(f"FAIL {m} hd={holder_delta} < {MIN_HOLDER_DELTA}"); return False, momentum
+    if now_s.top1_pct  > MAX_TOP1_PCT:
+        logger.warning(f"FAIL {m} top1={now_s.top1_pct} > {MAX_TOP1_PCT}"); return False, momentum
+    if now_s.curve_pct < 1.0:
+        logger.warning(f"FAIL {m} curve={now_s.curve_pct} < 1.0"); return False, momentum
     if len(snaps) >= 3:
         delta2 = prev.curve_pct - snaps[-3].curve_pct
         if curve_delta <= 0 and delta2 <= 0:
-            return False, momentum
+            logger.warning(f"FAIL {m} two_neg_windows cv={round(curve_velocity,3)}"); return False, momentum
 
+    logger.warning(f"PASS {entry.mint[:12]} cv={round(curve_velocity,2)} h={now_s.holder_count} hd={holder_delta} cp={now_s.curve_pct:.1f}%")
     return True, momentum
 
 # ── WATCHLIST LOOP ────────────────────────────────────────────────────────────
