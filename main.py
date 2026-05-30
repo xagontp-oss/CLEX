@@ -307,56 +307,30 @@ async def fetch_dev_history(dev_wallet: str) -> Dict:
     return info
 
 async def fetch_snapshot(mint: str) -> Snapshot:
-    """Snapshot using RPC getTokenAccounts for real holder count
-    and getSignaturesForAddress for tx velocity (bonding curve proxy).
-    getTokenLargestAccounts only returns top 20 — not true holder count.
-    We use tx count as curve_pct proxy: more txs = more curve progress."""
-    # Run both calls in parallel
-    sigs_res, supply_res = await asyncio.gather(
-        rpc("getSignaturesForAddress", [mint, {"limit": 50, "commitment": "confirmed"}]),
-        rpc("getTokenSupply", [mint, {"commitment": "confirmed"}]),
+    """Original working snapshot — bonding curve % from largest accounts,
+    holder count from top 20 wallets, tx count from signatures."""
+    holders_res, sigs_res = await asyncio.gather(
+        rpc("getTokenLargestAccounts", [mint, {"commitment": "confirmed"}]),
+        rpc("getSignaturesForAddress",  [mint, {"limit": 30, "commitment": "confirmed"}]),
     )
-
-    tx_count    = len(sigs_res) if sigs_res else 0
-    # Use tx count as a bonding curve velocity proxy
-    # 50 txs in first minute = strong signal, map to curve_pct 0-100
-    curve_pct   = min(100.0, round(tx_count * 2.0, 2))
-
-    # Get holder count from token largest accounts — imperfect but fast
-    holders_res = await rpc("getTokenLargestAccounts", [mint, {"commitment": "confirmed"}])
-    accounts    = (holders_res or {}).get("value", [])
-    # Filter out zero-balance and bonding curve account (largest holder)
-    # Real buyers are all accounts except the bonding curve
-    amounts = []
+    accounts = (holders_res or {}).get("value", [])
+    amounts  = []
     for a in accounts:
-        try:
-            amt = float(a.get("uiAmount") or 0)
-            if amt > 0: amounts.append(amt)
+        try: amounts.append(float(a.get("uiAmount") or 0))
         except Exception: pass
 
-    # Bonding curve holds the majority — skip it, count the rest as holders
-    # True holder count = all non-zero accounts except the largest (bonding curve)
-    holder_count = max(0, len(amounts) - 1) if amounts else 0
-    top1_pct     = 0.0
-    if len(amounts) >= 2:
-        # Second largest is the top real holder
-        top1_pct = round(amounts[1] / TOTAL_SUPPLY * 100, 2)
+    curve_pct = top1_pct = 0.0
+    holder_count = len(amounts)
+    if amounts:
+        # Largest account = bonding curve contract
+        # curve_pct = how much of the supply has been bought out
+        curve_pct = max(0.0, min(100.0, round((1 - amounts[0] / TOTAL_SUPPLY) * 100, 2)))
+        top1_pct  = round(amounts[0] / TOTAL_SUPPLY * 100, 2)
 
-    # Also use recent tx velocity for curve_pct — more reliable signal
-    if sigs_res and len(sigs_res) >= 2:
-        oldest = sigs_res[-1].get("blockTime") or 0
-        newest = sigs_res[0].get("blockTime") or 0
-        age_secs = max(newest - oldest, 1)
-        tx_rate = tx_count / (age_secs / 60)  # txs per minute
-        # Map tx rate to curve_pct: 10 tx/min = 20%, 50 tx/min = 100%
-        curve_pct = min(100.0, round(tx_rate * 2.0, 2))
-
+    tx_count = len(sigs_res) if sigs_res else 0
     return Snapshot(
-        t=time.time(),
-        curve_pct=curve_pct,
-        holder_count=holder_count,
-        top1_pct=top1_pct,
-        tx_count=tx_count,
+        t=time.time(), curve_pct=curve_pct,
+        holder_count=holder_count, top1_pct=top1_pct, tx_count=tx_count,
     )
 
 # ── RUG PRE-FILTER ────────────────────────────────────────────────────────────
@@ -370,8 +344,8 @@ def pre_filter_rug(meta: Dict, dev: Dict) -> Tuple[int, List[str]]:
 # Score 0-100. Coins are ranked by momentum quality, not binary pass/fail.
 # High scores alert immediately. Medium scores need more confirmation.
 # This gives 5-10 trades/hour without spam and without missing fast movers.
-CONVICTION_THRESHOLD_FAST   = 65   # alert immediately on first pass
-CONVICTION_THRESHOLD_SLOW   = 45   # alert after 2 consecutive passes
+CONVICTION_THRESHOLD_FAST   = 55   # alert immediately on first pass
+CONVICTION_THRESHOLD_SLOW   = 35   # alert after 2 consecutive passes
 _pending_conviction: Dict[str, int] = {}  # mint -> consecutive passes
 
 def _score_conviction(snaps: list, entry: "WatchlistEntry") -> Tuple[int, Dict]:
@@ -401,54 +375,51 @@ def _score_conviction(snaps: list, entry: "WatchlistEntry") -> Tuple[int, Dict]:
 
     score = 0
 
-    # ── 1. Transaction activity (0-25 pts) ────────────────────────────────
-    # tx_count reflects real buying pressure
-    tx = now_s.tx_count
-    if   tx >= 50: score += 25
-    elif tx >= 30: score += 20
-    elif tx >= 15: score += 15
-    elif tx >= 8:  score += 10
-    elif tx >= 3:  score += 5
-    # < 3 txs = not worth alerting, score stays low
+    # ── 1. Bonding curve fill % (0-25 pts) ───────────────────────────────
+    # Real curve_pct from getTokenLargestAccounts — original working signal
+    cp = now_s.curve_pct
+    if   cp >= 10: score += 25
+    elif cp >= 5:  score += 20
+    elif cp >= 2:  score += 15
+    elif cp >= 1:  score += 10
+    elif cp >= 0.5: score += 5
 
-    # ── 2. Tx velocity (acceleration) (0-25 pts) ──────────────────────────
-    # curve_velocity is tx-rate change between snapshots
+    # ── 2. Curve velocity (0-25 pts) ──────────────────────────────────────
+    # Rate of curve fill per minute — the original conviction signal
     cv = curve_velocity
-    if   cv >= 5.0: score += 25
-    elif cv >= 3.0: score += 20
-    elif cv >= 1.5: score += 15
-    elif cv >= 0.8: score += 10
-    elif cv >= 0.3: score += 5
+    if   cv >= 2.0: score += 25
+    elif cv >= 1.0: score += 20
+    elif cv >= 0.5: score += 15
+    elif cv >= 0.3: score += 10
+    elif cv >= 0.1: score += 5
 
-    # ── 3. Holder growth (0-25 pts) ───────────────────────────────────────
-    # Real wallets buying = distribution happening
+    # ── 3. Holder count + growth (0-25 pts) ───────────────────────────────
     hc = now_s.holder_count
     hd = holder_delta
-    if   hc >= 20 and hd >= 3: score += 25
+    if   hc >= 15 and hd >= 3: score += 25
     elif hc >= 10 and hd >= 2: score += 20
-    elif hc >= 6  and hd >= 1: score += 15
-    elif hc >= 3  and hd >= 1: score += 10
-    elif hc >= 2:               score += 5
+    elif hc >= 7  and hd >= 2: score += 15
+    elif hc >= 5  and hd >= 1: score += 10
+    elif hc >= 3  and hd >= 1: score += 5
 
-    # ── 4. Concentration check (0-15 pts) ────────────────────────────────
-    # Low top1 % = healthy distribution, not one whale
+    # ── 4. Top wallet concentration (0-15 pts) ────────────────────────────
+    # top1_pct here is the bonding curve % — lower = more bought out
     t1 = now_s.top1_pct
-    if   t1 == 0:    score += 15   # unknown — give benefit of doubt
-    elif t1 <= 10:   score += 15   # healthy spread
-    elif t1 <= 20:   score += 10
-    elif t1 <= 35:   score += 5
-    # > 35% concentrated = no bonus, potential dump risk
+    if   t1 <= 85:  score += 15   # curve >15% filled
+    elif t1 <= 90:  score += 10
+    elif t1 <= 95:  score += 5
+    # >95% = barely any buys = low score
 
-    # ── 5. Speed bonus (0-10 pts) ─────────────────────────────────────────
-    # Coins that pump fast within 60s of launch = stronger signal
-    if   age_secs <= 30:  score += 10
-    elif age_secs <= 60:  score += 7
-    elif age_secs <= 90:  score += 4
+    # ── 5. Tx count (0-10 pts) ────────────────────────────────────────────
+    tx = now_s.tx_count
+    if   tx >= 20: score += 10
+    elif tx >= 10: score += 7
+    elif tx >= 5:  score += 4
 
-    # ── Velocity must be positive — hard floor ─────────────────────────────
-    if curve_velocity <= 0:   score = min(score, 20)  # can't alert on declining
-    if holder_delta   < 0:    score = min(score, 15)  # losing holders = no alert
-    if now_s.tx_count < 3:    score = min(score, 10)  # too little activity
+    # ── Hard floors ───────────────────────────────────────────────────────
+    if curve_velocity <= 0:      score = min(score, 15)
+    if now_s.curve_pct < 0.5:   score = min(score, 20)
+    if holder_delta    < 0:      score = min(score, 10)
 
     return min(score, 100), momentum
 
