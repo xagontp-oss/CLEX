@@ -42,13 +42,13 @@ DB_PATH        = "clex.db"
 
 # ── TUNING ────────────────────────────────────────────────────────────────────
 WATCHLIST_TTL       = 300        # seconds a coin stays in watchlist
-CHECK_INTERVAL      = 30         # watchlist evaluation interval
-MAX_ALERTS_PER_HOUR = 5
-MIN_ALERT_GAP       = 180        # seconds between alerts
+CHECK_INTERVAL      = 15         # watchlist evaluation interval
+MAX_ALERTS_PER_HOUR = 10
+MIN_ALERT_GAP       = 60         # seconds between alerts
 MAX_RUG_SCORE       = int(os.getenv("MAX_RUG_SCORE", "55"))
-MIN_CURVE_VELOCITY  = 0.4        # %/min
-MIN_HOLDERS         = 12
-MIN_HOLDER_DELTA    = 2
+MIN_CURVE_VELOCITY  = 0.3        # %/min — lower = catch earlier
+MIN_HOLDERS         = 8          # lower = enter earlier on fast pumps
+MIN_HOLDER_DELTA    = 1          # just needs to be growing
 MAX_TOP1_PCT        = 50
 TOTAL_SUPPLY        = 1_000_000_000
 
@@ -393,7 +393,10 @@ def check_conviction(entry: WatchlistEntry) -> Tuple[bool, Dict]:
     if holder_delta    < MIN_HOLDER_DELTA:  return False, momentum
     if now_s.top1_pct  > MAX_TOP1_PCT:     return False, momentum
     if now_s.curve_pct < 1.0:              return False, momentum
-    if len(snaps) >= 3:
+    # One strong window is enough for fast pump.fun coins
+    # Two-window requirement kills entries on parabolic moves
+    if len(snaps) >= 3 and curve_velocity < 1.0:
+        # Only require consistency if move is not already strong
         if curve_delta <= 0 and (prev.curve_pct - snaps[-3].curve_pct) <= 0:
             return False, momentum
 
@@ -550,27 +553,7 @@ def _extract_launch(tx: Dict) -> Optional[Tuple[str, str]]:
         if mint.endswith("pump"): return mint, dev
     return None
 
-# Track current slot for freshness gating
-_current_slot: int = 0
-_slot_updated_at: float = 0.0
-
-async def _get_current_slot() -> int:
-    global _current_slot, _slot_updated_at
-    if time.time() - _slot_updated_at < 10:
-        return _current_slot
-    try:
-        async with aiohttp.ClientSession() as s:
-            async with s.post(_rpc_url(),
-                json={"jsonrpc":"2.0","id":1,"method":"getSlot","params":[]},
-                timeout=aiohttp.ClientTimeout(total=4)) as r:
-                data = await r.json()
-                _current_slot = data.get("result", 0)
-                _slot_updated_at = time.time()
-    except Exception:
-        pass
-    return _current_slot
-
-MAX_COIN_AGE_SECS = 120  # drop anything older than 2 minutes
+MAX_COIN_AGE_SECS = 120  # reject coins older than 2 minutes
 
 async def process_payload(payload: list):
     if not isinstance(payload, list): return
@@ -580,16 +563,19 @@ async def process_payload(payload: list):
         mint, dev_wallet = result
         if mint in watchlist or await already_seen(mint): continue
 
-        # Freshness gate — fetch pump.fun metadata and check creation time
-        # before doing anything else. This is the most reliable age check.
+        # ── Freshness gate using pump.fun API timestamp ───────────────────
+        # Must be called first. pump.fun returns created_timestamp (unix secs).
+        # Stream backfills deliver old blocks on reconnect — this kills them.
         meta = await fetch_token_metadata(mint)
-        created = meta.get("created_timestamp")  # unix seconds from pump.fun API
+        created = meta.get("created_timestamp")
         if created:
-            age = time.time() - float(created)
-            if age > MAX_COIN_AGE_SECS:
-                logger.debug(f"Stale coin {mint[:12]} age={age:.0f}s — skipped")
-                await mark_seen(mint)  # mark so we don't reprocess
+            age_secs = time.time() - float(created)
+            if age_secs > MAX_COIN_AGE_SECS:
+                logger.debug(f"Stale {mint[:12]} age={age_secs:.0f}s — dropped")
+                await mark_seen(mint)
                 continue
+        else:
+            age_secs = 0
 
         await mark_seen(mint)
         dev = await fetch_dev_history(dev_wallet)
@@ -597,24 +583,23 @@ async def process_payload(payload: list):
         if rug_risk >= 85:
             logger.debug(f"Discard {mint[:12]} rug={rug_risk}"); continue
 
-        # Record first buyers (limit to 5 to avoid DB lock flood)
         for acct in list(tx.get("accountData", []))[:5]:
             addr = acct.get("account", "")
             if addr and addr != dev_wallet:
                 asyncio.create_task(record_first_buyer(addr))
 
-        name = meta.get("name") or mint[:8]
         if len(watchlist) >= 50:
-            # Drop oldest entry to cap memory and RPC usage
             oldest = min(watchlist, key=lambda m: watchlist[m].added_at)
             watchlist.pop(oldest, None)
+
+        name = meta.get("name") or mint[:8]
         watchlist[mint] = WatchlistEntry(
             mint=mint, dev_wallet=dev_wallet,
             tx_sig=tx.get("signature", ""),
             added_at=time.time(), meta=meta, dev=dev,
             rug_risk=rug_risk, risk_flags=risk_flags,
         )
-        logger.info(f"Watchlist +{name} ({mint[:12]}) rug={rug_risk}")
+        logger.info(f"Watchlist +{name} ({mint[:12]}) age={int(age_secs)}s rug={rug_risk}")
 
 # ── KEYBOARDS ─────────────────────────────────────────────────────────────────
 def _kb_main(subscribed: bool) -> InlineKeyboardMarkup:
