@@ -538,6 +538,7 @@ def _extract_launch(tx: Dict) -> Optional[Tuple[str, str]]:
     for acct in tx.get("accountData", []):
         addr = acct.get("account", "")
         if addr.endswith("pump") and len(addr) in (43, 44):
+            logger.warning(f"EXTRACT_ACCT: {addr[:20]}")
             return addr, dev
     return None
 
@@ -1054,6 +1055,13 @@ app = FastAPI(lifespan=lifespan)
 @app.post("/webhook")
 async def webhook(req: Request):
     payload = await req.json()
+    # Log first tx structure once so we can see exact Quicknode format
+    if isinstance(payload, list) and payload:
+        tx = payload[0]
+        logger.warning(f"PAYLOAD_KEYS: {list(tx.keys())}")
+        logger.warning(f"PAYLOAD_TYPE: {tx.get('type')}")
+        logger.warning(f"PAYLOAD_TRANSFERS: {tx.get('tokenTransfers')}")
+        logger.warning(f"PAYLOAD_ACCT_SAMPLE: {[a.get('account','')[:20] for a in tx.get('accountData',[])[:5]]}")
     asyncio.create_task(process_payload(payload))
     return {"ok": True}
 
