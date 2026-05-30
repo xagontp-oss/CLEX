@@ -32,34 +32,51 @@ JUPITER_SWAP   = "https://quote-api.jup.ag/v6/swap"
 WSOL_MINT      = "So11111111111111111111111111111111111111112"
 
 POSITION_CHECK_INTERVAL = 15
-MIN_BUY_INTERVAL        = 30
+MIN_BUY_INTERVAL        = 10
 LIVE_UPDATE_INTERVAL    = 60
 RUG_DROP_THRESHOLD      = 0.15
 MAX_OPEN_EXPOSURE_PCT   = 0.30
 BLACKLIST_THRESHOLD     = 3
 
 # ── RISK PROFILES ─────────────────────────────────────────────────────────────
+# ── PROFIT PHILOSOPHY ─────────────────────────────────────────────────────────
+# pump.fun coins peak in 1-3 minutes. Strategy: get in fast, take 60-70%
+# profit at first target, trail the rest. Never hold hoping for more.
+# T1 = quick guaranteed profit. T2 = trail remaining for moonshot slice.
 RISK_PROFILES = {
     "low": {
         "label": "🛡 Low Risk", "buy_pct": 0.05, "max_buy": 0.10,
-        "slippage": 10, "priority_fee": 0.001, "skip_preflight": False,
-        "trailing_stop_pct": 0.25, "tiered_t1_mult": 2.0, "tiered_t2_mult": 4.0,
-        "fixed_tp": 1.8, "fixed_sl": 0.75, "time_decay_mins": 10,
-        "desc": "5% of balance · trail 25% · tiered exits",
+        "slippage": 12, "priority_fee": 0.001, "skip_preflight": False,
+        # Sell 60% at 1.4x (40% profit secured fast), trail rest 20%
+        "trailing_stop_pct": 0.20,
+        "tiered_t1_mult": 1.4, "tiered_t1_pct": 0.60,   # sell 60% at 1.4x
+        "tiered_t2_mult": 2.0, "tiered_t2_pct": 0.25,   # sell 25% at 2x
+        # trail remaining 15% with 20% stop
+        "fixed_tp": 1.35, "fixed_sl": 0.82,             # weak mode: tight exits
+        "time_decay_mins": 3,                             # exit after 3min if no move
+        "desc": "5% bal · sell 60% at 1.4x · trail rest · 3min decay",
     },
     "moderate": {
         "label": "⚡ Moderate", "buy_pct": 0.10, "max_buy": 0.25,
         "slippage": 15, "priority_fee": 0.003, "skip_preflight": True,
-        "trailing_stop_pct": 0.30, "tiered_t1_mult": 2.5, "tiered_t2_mult": 6.0,
-        "fixed_tp": 2.2, "fixed_sl": 0.60, "time_decay_mins": 8,
-        "desc": "10% of balance · trail 30% · tiered exits",
+        # Sell 60% at 1.5x, trail rest 25%
+        "trailing_stop_pct": 0.25,
+        "tiered_t1_mult": 1.5, "tiered_t1_pct": 0.60,
+        "tiered_t2_mult": 2.5, "tiered_t2_pct": 0.25,
+        "fixed_tp": 1.45, "fixed_sl": 0.78,
+        "time_decay_mins": 3,
+        "desc": "10% bal · sell 60% at 1.5x · trail rest · 3min decay",
     },
     "psycho": {
         "label": "🤑 Psycho", "buy_pct": 0.20, "max_buy": 0.50,
         "slippage": 25, "priority_fee": 0.005, "skip_preflight": True,
-        "trailing_stop_pct": 0.35, "tiered_t1_mult": 3.0, "tiered_t2_mult": 10.0,
-        "fixed_tp": 2.5, "fixed_sl": 0.40, "time_decay_mins": 6,
-        "desc": "20% of balance · trail 35% · max aggression",
+        # Sell 60% at 1.6x, trail rest 30% — ride runners harder
+        "trailing_stop_pct": 0.30,
+        "tiered_t1_mult": 1.6, "tiered_t1_pct": 0.60,
+        "tiered_t2_mult": 3.0, "tiered_t2_pct": 0.25,
+        "fixed_tp": 1.5, "fixed_sl": 0.72,
+        "time_decay_mins": 2,
+        "desc": "20% bal · sell 60% at 1.6x · trail rest · 2min decay",
     },
 }
 
@@ -509,7 +526,26 @@ async def confirm_transaction(sig: str, timeout_s: int = 25) -> bool:
             await asyncio.sleep(1.5)
     return False
 
+async def _pump_price_sol(mint: str, token_amount: float) -> float:
+    """Get token value via pump.fun bonding curve API."""
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(
+                f"https://frontend-api.pump.fun/coins/{mint}",
+                timeout=aiohttp.ClientTimeout(total=5)) as r:
+                if r.status != 200: return 0.0
+                d = await r.json()
+                # price per token in SOL = market_cap_sol / total_supply
+                mc_sol = float(d.get("market_cap") or 0)
+                supply = float(d.get("total_supply") or 1_000_000_000)
+                if mc_sol <= 0 or supply <= 0: return 0.0
+                price_per_token = mc_sol / supply
+                return price_per_token * token_amount
+    except Exception:
+        return 0.0
+
 async def get_position_value_sol(mint: str, token_amount: float) -> float:
+    """Try Jupiter first (graduated tokens), fall back to pump.fun curve price."""
     try:
         data     = await _rpc("getTokenSupply", [mint])
         decimals = (data or {}).get("value", {}).get("decimals", 6)
@@ -520,10 +556,13 @@ async def get_position_value_sol(mint: str, token_amount: float) -> float:
                 params={"inputMint": mint, "outputMint": WSOL_MINT,
                         "amount": lamps, "slippageBps": 500},
                 timeout=aiohttp.ClientTimeout(total=5)) as r:
-                if r.status != 200: return 0.0
-                return int((await r.json()).get("outAmount", 0)) / 1e9
+                if r.status == 200:
+                    out = int((await r.json()).get("outAmount", 0)) / 1e9
+                    if out > 0: return out
     except Exception:
-        return 0.0
+        pass
+    # Fall back to pump.fun bonding curve price
+    return await _pump_price_sol(mint, token_amount)
 
 async def is_graduated(mint: str) -> bool:
     try:
@@ -535,49 +574,8 @@ async def is_graduated(mint: str) -> bool:
         return False
 
 async def fingerprint_dev_wallet(dev_wallet: str) -> Dict:
-    result = {"single_funder": False, "flag": None}
-    try:
-        sigs = await _rpc("getSignaturesForAddress",
-                          [dev_wallet, {"limit": 50, "commitment": "confirmed"}])
-        if not sigs: return result
-        cutoff = time.time() - 7 * 86400
-        recent = [s for s in sigs if (s.get("blockTime") or 0) >= cutoff]
-        if not recent: return result
-        inflows: Dict[str, float] = {}
-        for sig_info in recent[:20]:
-            try:
-                tx = await _rpc("getTransaction",
-                    [sig_info["signature"],
-                     {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}])
-                if not tx: continue
-                meta = tx.get("meta", {})
-                pre  = meta.get("preBalances", [])
-                post = meta.get("postBalances", [])
-                keys = (tx.get("transaction", {}).get("message", {})
-                          .get("accountKeys", []))
-                for i, key in enumerate(keys):
-                    addr = key if isinstance(key, str) else key.get("pubkey", "")
-                    if addr == dev_wallet and i < len(pre) and i < len(post):
-                        delta = (post[i] - pre[i]) / 1e9
-                        if delta > 0.01:
-                            for j, k2 in enumerate(keys):
-                                a2 = k2 if isinstance(k2, str) else k2.get("pubkey", "")
-                                if a2 != dev_wallet and j < len(pre) and j < len(post):
-                                    d2 = (pre[j] - post[j]) / 1e9
-                                    if d2 > 0:
-                                        inflows[a2] = inflows.get(a2, 0) + d2
-                await asyncio.sleep(0.05)
-            except Exception:
-                continue
-        if inflows:
-            top_amt = max(inflows.values())
-            total   = sum(inflows.values())
-            if total > 0 and top_amt / total >= 0.80:
-                result["single_funder"] = True
-                result["flag"] = "🔴 Funded 80%+ from single source"
-    except Exception:
-        pass
-    return result
+    """Disabled — was consuming too many RPC credits (30 calls per coin)."""
+    return {"single_funder": False, "flag": None}
 
 # ── BUY ENGINE ────────────────────────────────────────────────────────────────
 async def _buy_pumpfun(mint: str, pubkey: str, kp, profile: Dict,
@@ -821,25 +819,29 @@ async def position_monitor_loop():
                 # Exit logic
                 exited = False
                 if exit_mode == "momentum":
+                    t1_pct = profile.get("tiered_t1_pct", 0.60)
+                    t2_pct = profile.get("tiered_t2_pct", 0.25)
                     if not pos["tier1_sold"] and ratio >= profile["tiered_t1_mult"]:
-                        ok, sig, out = await execute_partial_sell(pos, 0.40, 1)
+                        ok, sig, out = await execute_partial_sell(pos, t1_pct, 1)
                         if ok:
                             await _notify(uid,
-                                f"🟢 *Tier 1 — {profile['tiered_t1_mult']}x*\n"
-                                f"*{name}* sold 40% → +{out:.4f} SOL\n`{sig[:20]}...`")
+                                f"🟢 *T1 Exit {profile['tiered_t1_mult']}x — {int(t1_pct*100)}% sold*\n"
+                                f"*{name}* +{out:.4f} SOL secured\n"
+                                f"Trailing rest · `{sig[:20]}...`")
                         exited = True
                     elif pos["tier1_sold"] and not pos["tier2_sold"] and ratio >= profile["tiered_t2_mult"]:
-                        ok, sig, out = await execute_partial_sell(pos, 0.583, 2)
+                        ok, sig, out = await execute_partial_sell(pos, t2_pct / (1 - t1_pct), 2)
                         if ok:
                             await _notify(uid,
-                                f"🚀 *Tier 2 — {profile['tiered_t2_mult']}x*\n"
-                                f"*{name}* sold 35% more → +{out:.4f} SOL\n`{sig[:20]}...`")
+                                f"🚀 *T2 Exit {profile['tiered_t2_mult']}x — more profit locked*\n"
+                                f"*{name}* +{out:.4f} SOL\n"
+                                f"Trailing last slice · `{sig[:20]}...`")
                         exited = True
                     elif pos["tier2_sold"] and cur_val <= trail_stop:
                         ok, sig, pnl, pct_ = await execute_full_sell(pos, "tp")
                         if ok:
                             await _notify(uid,
-                                f"🏁 *Trail Exit*\n*{name}* peak {peak_ratio:.2f}x\n"
+                                f"🏁 *Trail Exit — Full Close*\n*{name}* peak {peak_ratio:.2f}x\n"
                                 f"PnL: {pnl:+.4f} SOL ({pct_:.1f}%)\n`{sig[:20]}...`")
                         exited = True
                     elif not pos["tier1_sold"] and cur_val <= trail_stop:
