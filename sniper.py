@@ -1,6 +1,11 @@
 """
-CLEX Sniper Module — QuickNode RPC, dynamic sizing, intelligent exits,
+CLEX Sniper Module — Helius RPC, dynamic sizing, intelligent exits,
 rug detection, blacklist, graduated token support, performance tracker.
+
+Efficiency build:
+  • Token decimals are immutable -> cached, removing per-cycle getTokenSupply.
+  • Confirmations poll the FREE public RPC, not the metered Helius node.
+  • Graduation is resolved once per alert and passed in, not per-sniper.
 """
 import asyncio
 import aiosqlite
@@ -19,12 +24,15 @@ logger = logging.getLogger(__name__)
 MASTER_KEY = os.getenv("MASTER_ENCRYPTION_KEY", "")
 DB_PATH    = "clex.db"
 
+# Free public endpoint — used for confirmations and as a redundant send target.
+PUBLIC_RPC = "https://api.mainnet-beta.solana.com"
+
 def _rpc_url() -> str:
     qn  = os.getenv("QUICKNODE_RPC", "")
     hel = os.getenv("HELIUS_API_KEY", "")
     if qn:  return qn
     if hel: return f"https://mainnet.helius-rpc.com/?api-key={hel}"
-    return "https://api.mainnet-beta.solana.com"
+    return PUBLIC_RPC
 
 PUMPPORTAL_URL = "https://pumpportal.fun/api/trade-local"
 JUPITER_QUOTE  = "https://quote-api.jup.ag/v6/quote"
@@ -38,11 +46,17 @@ RUG_DROP_THRESHOLD      = 0.15
 MAX_OPEN_EXPOSURE_PCT   = 0.30
 BLACKLIST_THRESHOLD     = 3
 
+# Immutable on-chain values — cache forever, never re-fetch.
+_decimals_cache: Dict[str, int] = {}
+
 # ── RISK PROFILES ─────────────────────────────────────────────────────────────
 # ── PROFIT PHILOSOPHY ─────────────────────────────────────────────────────────
 # pump.fun coins peak in 1-3 minutes. Strategy: get in fast, take 60-70%
 # profit at first target, trail the rest. Never hold hoping for more.
 # T1 = quick guaranteed profit. T2 = trail remaining for moonshot slice.
+#
+# Sizing is PERCENTAGE-based, so even a ~$5 wallet trades: at 0.03 SOL,
+# Low buys ~0.0015 SOL. For exact small tickets, set a Custom Amount.
 RISK_PROFILES = {
     "low": {
         "label": "🛡 Low Risk", "buy_pct": 0.05, "max_buy": 0.10,
@@ -106,7 +120,7 @@ def decrypt_key(k: str) -> str: return _fernet().decrypt(k.encode()).decode()
 
 # ── DB INIT ───────────────────────────────────────────────────────────────────
 async def init_sniper_db():
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
         await db.executescript("""
             CREATE TABLE IF NOT EXISTS sniper_users (
                 user_id        INTEGER PRIMARY KEY,
@@ -189,7 +203,7 @@ async def init_sniper_db():
 
 # ── USER CRUD ─────────────────────────────────────────────────────────────────
 async def get_sniper_user(user_id: int) -> Optional[Dict]:
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
         cur = await db.execute(
             "SELECT user_id,pubkey,risk_profile,sniper_enabled,last_buy_at "
             "FROM sniper_users WHERE user_id=?", (user_id,))
@@ -200,7 +214,7 @@ async def get_sniper_user(user_id: int) -> Optional[Dict]:
 
 async def save_sniper_user(user_id: int, pk_b58: str, pubkey: str, risk: str):
     enc = encrypt_key(pk_b58)
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
         await db.execute(
             "INSERT OR REPLACE INTO sniper_users "
             "(user_id,encrypted_key,pubkey,risk_profile,sniper_enabled,setup_at) "
@@ -208,7 +222,7 @@ async def save_sniper_user(user_id: int, pk_b58: str, pubkey: str, risk: str):
         await db.commit()
 
 async def delete_sniper_user(user_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
         await db.execute("DELETE FROM sniper_users WHERE user_id=?", (user_id,))
         await db.execute(
             "UPDATE sniper_positions SET status='wallet_deleted' "
@@ -216,32 +230,32 @@ async def delete_sniper_user(user_id: int):
         await db.commit()
 
 async def toggle_sniper(user_id: int, enabled: bool):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
         await db.execute("UPDATE sniper_users SET sniper_enabled=? WHERE user_id=?",
                          (1 if enabled else 0, user_id))
         await db.commit()
 
 async def update_risk_profile(user_id: int, profile: str):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
         await db.execute("UPDATE sniper_users SET risk_profile=? WHERE user_id=?",
                          (profile, user_id))
         await db.commit()
 
 async def set_custom_amount(user_id: int, amount: Optional[float]):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
         await db.execute("UPDATE sniper_users SET custom_amount=? WHERE user_id=?",
                          (amount, user_id))
         await db.commit()
 
 async def get_custom_amount(user_id: int) -> Optional[float]:
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
         cur = await db.execute(
             "SELECT custom_amount FROM sniper_users WHERE user_id=?", (user_id,))
         row = await cur.fetchone()
         return row[0] if row else None
 
 async def get_enabled_snipers() -> List[Dict]:
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
         cur = await db.execute(
             "SELECT user_id,encrypted_key,pubkey,risk_profile,last_buy_at "
             "FROM sniper_users WHERE sniper_enabled=1")
@@ -250,13 +264,13 @@ async def get_enabled_snipers() -> List[Dict]:
                  "risk_profile": r[3], "last_buy_at": r[4]} for r in rows]
 
 async def _set_last_buy(user_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
         await db.execute("UPDATE sniper_users SET last_buy_at=? WHERE user_id=?",
                          (time.time(), user_id))
         await db.commit()
 
 async def _get_enc_key(user_id: int) -> Optional[str]:
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
         cur = await db.execute(
             "SELECT encrypted_key FROM sniper_users WHERE user_id=?", (user_id,))
         row = await cur.fetchone()
@@ -264,20 +278,20 @@ async def _get_enc_key(user_id: int) -> Optional[str]:
 
 # ── SETUP STATE ───────────────────────────────────────────────────────────────
 async def set_setup_state(user_id: int, step: str, risk: Optional[str] = None):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
         await db.execute("INSERT OR REPLACE INTO sniper_setup_state VALUES (?,?,?)",
                          (user_id, step, risk))
         await db.commit()
 
 async def get_setup_state(user_id: int) -> Optional[Dict]:
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
         cur = await db.execute(
             "SELECT step,risk_profile FROM sniper_setup_state WHERE user_id=?", (user_id,))
         row = await cur.fetchone()
         return {"step": row[0], "risk": row[1]} if row else None
 
 async def clear_setup_state(user_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
         await db.execute("DELETE FROM sniper_setup_state WHERE user_id=?", (user_id,))
         await db.commit()
 
@@ -298,14 +312,14 @@ async def record_first_buyer(wallet: str):
         pass
 
 async def is_blacklisted(wallet: str) -> bool:
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
         cur = await db.execute(
             "SELECT snipe_count FROM sniper_blacklist WHERE wallet=?", (wallet,))
         row = await cur.fetchone()
         return row is not None and row[0] >= BLACKLIST_THRESHOLD
 
 async def get_blacklist_count() -> int:
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
         cur = await db.execute(
             "SELECT COUNT(*) FROM sniper_blacklist WHERE snipe_count>=?",
             (BLACKLIST_THRESHOLD,))
@@ -316,7 +330,7 @@ async def save_position(user_id: int, mint: str, name: str, symbol: str,
                         sol_spent: float, token_amount: float,
                         buy_tx: str, exit_mode: str):
     now = time.time()
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
         await db.execute(
             "INSERT INTO sniper_positions "
             "(user_id,mint,name,symbol,sol_spent,token_amount,buy_tx,bought_at,"
@@ -327,7 +341,7 @@ async def save_position(user_id: int, mint: str, name: str, symbol: str,
         await db.commit()
 
 async def get_open_positions(user_id: Optional[int] = None) -> List[Dict]:
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
         if user_id:
             cur = await db.execute(
                 "SELECT id,user_id,mint,name,symbol,sol_spent,token_amount,bought_at,"
@@ -347,7 +361,7 @@ async def get_open_positions(user_id: Optional[int] = None) -> List[Dict]:
             for r in rows]
 
 async def get_total_open_exposure(user_id: int) -> float:
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
         cur = await db.execute(
             "SELECT SUM(sol_spent) FROM sniper_positions "
             "WHERE status='open' AND user_id=?", (user_id,))
@@ -355,7 +369,7 @@ async def get_total_open_exposure(user_id: int) -> float:
         return row[0] or 0.0
 
 async def _update_peak(pos_id: int, peak: float, trail: float):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
         await db.execute(
             "UPDATE sniper_positions SET peak_value_sol=?,trailing_stop=? WHERE id=?",
             (peak, trail, pos_id))
@@ -363,14 +377,14 @@ async def _update_peak(pos_id: int, peak: float, trail: float):
 
 async def _mark_tier(pos_id: int, tier: int, new_tokens: float):
     col = "tier1_sold" if tier == 1 else "tier2_sold"
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
         await db.execute(
             f"UPDATE sniper_positions SET {col}=1,token_amount=? WHERE id=?",
             (new_tokens, pos_id))
         await db.commit()
 
 async def update_last_notified(pos_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
         await db.execute(
             "UPDATE sniper_positions SET last_update_at=? WHERE id=?",
             (time.time(), pos_id))
@@ -378,7 +392,7 @@ async def update_last_notified(pos_id: int):
 
 async def close_position(pos_id: int, status: str, sell_tx: str,
                          pnl_sol: float, pnl_pct: float):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
         await db.execute(
             "UPDATE sniper_positions SET status=?,sell_tx=?,pnl_sol=?,pnl_pct=? WHERE id=?",
             (status, sell_tx, pnl_sol, pnl_pct, pos_id))
@@ -387,7 +401,7 @@ async def close_position(pos_id: int, status: str, sell_tx: str,
 # ── PERFORMANCE ───────────────────────────────────────────────────────────────
 async def record_performance(pos: Dict, sol_received: float,
                              pnl_sol: float, pnl_pct: float, reason: str):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
         await db.execute(
             "INSERT INTO sniper_performance "
             "(user_id,mint,name,symbol,sol_spent,sol_received,pnl_sol,pnl_pct,"
@@ -398,7 +412,7 @@ async def record_performance(pos: Dict, sol_received: float,
         await db.commit()
 
 async def get_performance_stats(user_id: int) -> Dict:
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
         cur = await db.execute(
             "SELECT pnl_sol,pnl_pct,exit_reason,hold_secs,name,symbol "
             "FROM sniper_performance WHERE user_id=? ORDER BY closed_at DESC", (user_id,))
@@ -478,6 +492,16 @@ async def _rpc(method: str, params: list) -> Optional[Dict]:
         pass
     return None
 
+async def _get_decimals(mint: str) -> int:
+    """Token decimals are immutable — fetch once, cache forever.
+    This removes a getTokenSupply call from every monitor cycle and every sell."""
+    if mint in _decimals_cache:
+        return _decimals_cache[mint]
+    data = await _rpc("getTokenSupply", [mint])
+    dec  = (data or {}).get("value", {}).get("decimals", 6)
+    _decimals_cache[mint] = dec
+    return dec
+
 async def _send_tx(url: str, tx_b64: str, skip: bool) -> Optional[str]:
     try:
         async with aiohttp.ClientSession() as s:
@@ -500,7 +524,7 @@ async def send_transaction_fast(tx_bytes: bytes, keypair, skip: bool = True) -> 
     tx_b64 = base64.b64encode(bytes(signed)).decode()
     results = await asyncio.gather(
         _send_tx(_rpc_url(), tx_b64, skip),
-        _send_tx("https://api.mainnet-beta.solana.com", tx_b64, skip),
+        _send_tx(PUBLIC_RPC, tx_b64, skip),
         return_exceptions=True)
     for r in results:
         if isinstance(r, str) and r:
@@ -508,14 +532,16 @@ async def send_transaction_fast(tx_bytes: bytes, keypair, skip: bool = True) -> 
     return None
 
 async def confirm_transaction(sig: str, timeout_s: int = 25) -> bool:
+    """Confirmation status does not require a paid node — poll the free RPC.
+    searchTransactionHistory stays False (cheaper, sufficient for fresh sigs)."""
     deadline = time.time() + timeout_s
     async with aiohttp.ClientSession() as s:
         while time.time() < deadline:
             try:
-                async with s.post(_rpc_url(),
+                async with s.post(PUBLIC_RPC,
                     json={"jsonrpc": "2.0", "id": 1,
                           "method": "getSignatureStatuses",
-                          "params": [[sig], {"searchTransactionHistory": True}]},
+                          "params": [[sig], {"searchTransactionHistory": False}]},
                     timeout=aiohttp.ClientTimeout(total=4)) as r:
                     data = await r.json()
                     val  = ((data.get("result") or {}).get("value") or [None])[0]
@@ -523,7 +549,7 @@ async def confirm_transaction(sig: str, timeout_s: int = 25) -> bool:
                         return True
             except Exception:
                 pass
-            await asyncio.sleep(1.5)
+            await asyncio.sleep(2)
     return False
 
 async def _pump_price_sol(mint: str, token_amount: float) -> float:
@@ -545,10 +571,10 @@ async def _pump_price_sol(mint: str, token_amount: float) -> float:
         return 0.0
 
 async def get_position_value_sol(mint: str, token_amount: float) -> float:
-    """Try Jupiter first (graduated tokens), fall back to pump.fun curve price."""
+    """Try Jupiter first (graduated tokens), fall back to pump.fun curve price.
+    Decimals are cached, so this costs no Helius credit on the hot path."""
     try:
-        data     = await _rpc("getTokenSupply", [mint])
-        decimals = (data or {}).get("value", {}).get("decimals", 6)
+        decimals = await _get_decimals(mint)
         lamps    = int(token_amount * (10 ** decimals))
         if lamps <= 0: return 0.0
         async with aiohttp.ClientSession() as s:
@@ -626,7 +652,8 @@ async def _buy_jupiter(mint: str, pubkey: str, kp, profile: Dict,
 
 async def execute_user_buy(user_id: int, mint: str, name: str,
                            symbol: str, momentum: Dict,
-                           top_holders: Optional[List[str]] = None
+                           top_holders: Optional[List[str]] = None,
+                           graduated: Optional[bool] = None
                            ) -> Tuple[bool, str, str, float, str]:
     user = await get_sniper_user(user_id)
     if not user or not user["sniper_enabled"]:
@@ -654,7 +681,10 @@ async def execute_user_buy(user_id: int, mint: str, name: str,
 
     enc_key   = await _get_enc_key(user_id)
     kp        = load_keypair(enc_key)
-    graduated = await is_graduated(mint)
+    # Graduation is resolved once per alert and passed in; only resolve here
+    # if a caller (e.g. a future manual buy) didn't supply it.
+    if graduated is None:
+        graduated = await is_graduated(mint)
 
     if not graduated:
         ok, sig = await _buy_pumpfun(mint, pubkey, kp, profile, buy_sol)
@@ -679,8 +709,7 @@ async def execute_user_buy(user_id: int, mint: str, name: str,
 async def _sell_jupiter(mint: str, tokens: float, pubkey: str, kp,
                         profile: Dict) -> Tuple[bool, str, float]:
     try:
-        data     = await _rpc("getTokenSupply", [mint])
-        decimals = (data or {}).get("value", {}).get("decimals", 6)
+        decimals = await _get_decimals(mint)
         lamps    = int(tokens * (10 ** decimals))
         slip_bps = profile["slippage"] * 100
         prio     = int(profile["priority_fee"] * 1e9)
