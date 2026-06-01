@@ -1,7 +1,13 @@
 """
 CLEX — pump.fun callout + sniper bot.
-Quicknode stream → webhook delivery.
-Proven binary conviction gate. New sniper framework (tiered exits).
+Helius webhook delivery. Proven binary conviction gate.
+
+Efficiency build (Helius-credit conscious):
+  • Snapshot loop fetches holders only; tx_count is fetched once at alert time.
+  • Per-coin polling cadence is adaptive (hot/warm/cold) instead of fixed 15s.
+  • Dev history is fetched only for coins that PASS, at alert time.
+  • Token metadata comes from the webhook first; DAS is a fallback only.
+  • Graduation is resolved once per alert and shared across all snipers.
 """
 import asyncio
 import aiosqlite
@@ -16,7 +22,7 @@ from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.types import (Message, InlineKeyboardMarkup,
-                            InlineKeyboardButton, CallbackQuery)
+                            InlineKeyboardButton, CallbackQuery, BotCommand)
 from aiogram.filters import Command
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramAPIError
@@ -33,7 +39,7 @@ from sniper import (
     get_sol_balance, validate_private_key, get_setup_state,
     set_setup_state, clear_setup_state, position_monitor_loop,
     set_alert_callback, set_custom_amount, get_custom_amount,
-    record_first_buyer, fingerprint_dev_wallet,
+    record_first_buyer, fingerprint_dev_wallet, is_graduated,
 )
 import sniper as sn
 
@@ -43,7 +49,7 @@ DB_PATH        = "clex.db"
 
 # ── TUNING — original values that produced good callouts ─────────────────────
 WATCHLIST_TTL       = 300
-CHECK_INTERVAL      = 15
+CHECK_INTERVAL      = 5      # fine scheduler tick; real cadence is per-coin adaptive
 MAX_ALERTS_PER_HOUR = 10
 MIN_ALERT_GAP       = 60
 MAX_RUG_SCORE       = int(os.getenv("MAX_RUG_SCORE", "55"))
@@ -53,6 +59,7 @@ MIN_HOLDER_DELTA    = 2      # proven threshold
 MAX_TOP1_PCT        = 50
 TOTAL_SUPPLY        = 1_000_000_000
 MAX_COIN_AGE_SLOTS  = 200    # ~80 seconds at 400ms/slot
+FRESHNESS_MAX_SECS  = 90     # drop launches whose webhook timestamp is older
 
 PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 
@@ -129,6 +136,7 @@ class WatchlistEntry:
     rug_risk: int
     risk_flags: List[str]
     snapshots: List[Snapshot] = field(default_factory=list)
+    last_snap_at: float = 0.0
 
 watchlist:     Dict[str, WatchlistEntry] = {}
 alert_times:   List[float] = []
@@ -147,9 +155,15 @@ def record_alert():
     alert_times.append(time.time())
     last_alert_at = time.time()
 
+def _snap_interval(age_s: float) -> float:
+    """Adaptive polling: spend credits in the window that actually matters."""
+    if age_s < 60:  return 10    # hot — first minute decides everything
+    if age_s < 180: return 20    # warm
+    return 45                     # cold — barely poll
+
 # ── DB ────────────────────────────────────────────────────────────────────────
 async def init_db():
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
         await db.executescript("""
             CREATE TABLE IF NOT EXISTS subscribers (
                 chat_id   INTEGER PRIMARY KEY,
@@ -166,52 +180,88 @@ async def init_db():
             );
         """)
         await db.commit()
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
         await db.execute(
             "DELETE FROM seen_tokens "
             "WHERE alerted_at < datetime('now', '-10 minutes')")
         await db.commit()
 
 async def get_subscribers() -> List[int]:
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
         cur = await db.execute("SELECT chat_id FROM subscribers")
         return [r[0] for r in await cur.fetchall()]
 
 async def is_subscriber(chat_id: int) -> bool:
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
         cur = await db.execute(
             "SELECT 1 FROM subscribers WHERE chat_id=?", (chat_id,))
         return await cur.fetchone() is not None
 
 async def add_subscriber(chat_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
         await db.execute(
             "INSERT OR IGNORE INTO subscribers VALUES (?, CURRENT_TIMESTAMP)",
             (chat_id,))
         await db.commit()
 
 async def remove_subscriber(chat_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
         await db.execute("DELETE FROM subscribers WHERE chat_id=?", (chat_id,))
         await db.commit()
 
 async def already_seen(mint: str) -> bool:
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
         cur = await db.execute(
             "SELECT 1 FROM seen_tokens WHERE mint=?", (mint,))
         return await cur.fetchone() is not None
 
 async def mark_seen(mint: str):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
         await db.execute(
             "INSERT OR IGNORE INTO seen_tokens VALUES (?, CURRENT_TIMESTAMP)",
             (mint,))
         await db.commit()
 
 # ── METADATA ─────────────────────────────────────────────────────────────────
-async def fetch_token_metadata(mint: str) -> Dict:
-    """Helius DAS first (reliable names), pump.fun API for MC/socials."""
-    # Try Helius DAS getAsset — this is what gave real names in the old version
+def _meta_from_webhook(tx: Dict) -> Dict:
+    """Zero-cost metadata straight from the webhook payload, when present.
+
+    Helius/Quicknode enhanced CREATE payloads vary in shape — MAP THIS to the
+    exact fields you see in your `PAYLOAD_KEYS` logs. It returns {} whenever it
+    can't find a usable name, so fetch_token_metadata falls through to the
+    metered DAS call only when the webhook genuinely lacked the data.
+    """
+    if not isinstance(tx, dict):
+        return {}
+    name   = tx.get("name") or tx.get("tokenName") or ""
+    symbol = tx.get("symbol") or tx.get("tokenSymbol") or ""
+    # Some enhanced streams nest token metadata under 'events' / 'meta'.
+    ev = tx.get("events") or {}
+    if isinstance(ev, dict):
+        token_ev = ev.get("token") or ev.get("nft") or {}
+        if isinstance(token_ev, dict):
+            name   = name   or token_ev.get("name", "")
+            symbol = symbol or token_ev.get("symbol", "")
+    if not name:
+        return {}
+    return {
+        "name": name, "symbol": symbol,
+        "description": tx.get("description", ""),
+        "twitter": tx.get("twitter", ""),
+        "telegram": tx.get("telegram", ""),
+        "website": tx.get("website", ""),
+        "usd_market_cap": float(tx.get("usd_market_cap") or 0),
+    }
+
+async def fetch_token_metadata(mint: str, tx: Optional[Dict] = None) -> Dict:
+    """Webhook first (free), Helius DAS fallback (metered), pump.fun enrich."""
+    # 1) Free path — use what the webhook already gave us.
+    if tx is not None:
+        wm = _meta_from_webhook(tx)
+        if wm.get("name"):
+            return wm
+
+    # 2) Metered fallback — DAS getAsset gives reliable names.
     result = await das("getAsset", {"id": mint})
     meta: Dict = {}
     if result:
@@ -228,7 +278,7 @@ async def fetch_token_metadata(mint: str) -> Dict:
             "usd_market_cap": 0.0,
         }
 
-    # Enrich with pump.fun API (MC + socials) — best effort, may 403
+    # 3) Enrich with pump.fun API (MC + socials) — best effort, may 403.
     try:
         async with aiohttp.ClientSession() as s:
             async with s.get(
@@ -250,7 +300,7 @@ async def fetch_token_metadata(mint: str) -> Dict:
     return meta
 
 async def fetch_dev_history(dev_wallet: str) -> Dict:
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
         cur = await db.execute(
             "SELECT data, cached_at FROM dev_cache WHERE address=?",
             (dev_wallet,))
@@ -293,7 +343,7 @@ async def fetch_dev_history(dev_wallet: str) -> Dict:
         if info["tokens_created"] > 5:
             info["flags"].append(f"SERIAL_LAUNCHER_{info['tokens_created']}")
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
         await db.execute(
             "INSERT OR REPLACE INTO dev_cache VALUES (?,?,?)",
             (dev_wallet, jsonlib.dumps(info), time.time()))
@@ -301,21 +351,20 @@ async def fetch_dev_history(dev_wallet: str) -> Dict:
     return info
 
 async def fetch_snapshot(mint: str) -> Snapshot:
-    """Bonding curve % + holder count + tx count via Quicknode RPC.
-    Same logic as the original that produced good callouts."""
-    holders_res, sigs_res = await asyncio.gather(
-        rpc("getTokenLargestAccounts", [mint, {"commitment": "processed"}]),
-        rpc("getSignaturesForAddress",  [mint, {"limit": 30, "commitment": "processed"}]),
-    )
+    """Bonding curve % + holder count via Helius RPC — ONE call per snapshot.
+    tx_count is deliberately omitted here (it's not used by the conviction gate)
+    and fetched once at alert time via fetch_tx_count()."""
+    holders_res = await rpc("getTokenLargestAccounts",
+                            [mint, {"commitment": "processed"}])
     accounts = (holders_res or {}).get("value", [])
     amounts  = []
     for a in accounts:
-        try:
-            v = a.get("uiAmount")
-            if v is not None:
+        v = a.get("uiAmount")
+        if v is not None:
+            try:
                 amounts.append(float(v))
-        except Exception:
-            pass
+            except Exception:
+                pass
 
     curve_pct = top1_pct = 0.0
     holder_count = len(amounts)
@@ -324,14 +373,19 @@ async def fetch_snapshot(mint: str) -> Snapshot:
             (1 - amounts[0] / TOTAL_SUPPLY) * 100, 2)))
         top1_pct  = round(amounts[0] / TOTAL_SUPPLY * 100, 2)
 
-    tx_count = len(sigs_res) if sigs_res else 0
     logger.warning(
         f"SNAP {mint[:12]} curve={curve_pct:.2f}% "
-        f"h={holder_count} tx={tx_count} top1={top1_pct:.1f}%")
+        f"h={holder_count} top1={top1_pct:.1f}%")
     return Snapshot(
         t=time.time(), curve_pct=curve_pct,
-        holder_count=holder_count, top1_pct=top1_pct, tx_count=tx_count,
+        holder_count=holder_count, top1_pct=top1_pct, tx_count=0,
     )
+
+async def fetch_tx_count(mint: str) -> int:
+    """Single signatures lookup — called once when a coin actually passes."""
+    sigs = await rpc("getSignaturesForAddress",
+                     [mint, {"limit": 30, "commitment": "processed"}])
+    return len(sigs) if sigs else 0
 
 # ── PRE-FILTER ────────────────────────────────────────────────────────────────
 def pre_filter_rug(meta: Dict, dev: Dict) -> Tuple[int, List[str]]:
@@ -390,13 +444,17 @@ def check_conviction(entry: WatchlistEntry) -> Tuple[bool, Dict]:
 async def watchlist_loop():
     logger.info("Watchlist engine started")
     while True:
-        await asyncio.sleep(CHECK_INTERVAL)
-        now    = time.time()
+        await asyncio.sleep(CHECK_INTERVAL)   # fine tick; per-coin cadence is adaptive
+        now     = time.time()
         to_drop = []
         for mint, entry in list(watchlist.items()):
             age = now - entry.added_at
             if age > WATCHLIST_TTL:
                 to_drop.append(mint); continue
+            # Adaptive throttle — only snapshot when this coin is due.
+            if now - entry.last_snap_at < _snap_interval(age):
+                continue
+            entry.last_snap_at = now
             try:
                 snap = await fetch_snapshot(mint)
                 entry.snapshots.append(snap)
@@ -434,9 +492,24 @@ def _fmt_mc(usd: float) -> str:
 
 async def fire_alert(entry: WatchlistEntry, momentum: Dict):
     mint = entry.mint
-    dev  = entry.dev
 
-    # Refresh metadata at alert time for latest MC
+    # tx_count is fetched once, here, only for a coin that passed.
+    try:
+        momentum["tx_count"] = await fetch_tx_count(mint)
+    except Exception:
+        momentum["tx_count"] = momentum.get("tx_count", 0)
+
+    # Dev history is fetched once, here, only for a coin that passed (cached 15m).
+    try:
+        dev = await fetch_dev_history(entry.dev_wallet)
+    except Exception:
+        dev = {}
+    dev_flags = dev.get("flags", [])
+    dev_age   = dev.get("wallet_age_days", 0)
+    dev_toks  = dev.get("tokens_created", 0)
+    risk_line = " · ".join(dev_flags) if dev_flags else "None detected"
+
+    # Refresh metadata at alert time for the freshest MC (DAS, ≤10/hr).
     fresh = await fetch_token_metadata(mint)
     meta  = {**entry.meta, **fresh} if fresh.get("name") else entry.meta
 
@@ -454,7 +527,6 @@ async def fire_alert(entry: WatchlistEntry, momentum: Dict):
     if meta.get("telegram"): socials.append(f"[Telegram]({meta['telegram']})")
     if meta.get("website"):  socials.append(f"[Web]({meta['website']})")
     social_line = " · ".join(socials) if socials else "None"
-    risk_block  = "\n".join(entry.risk_flags) or "None detected"
 
     cv  = momentum.get("curve_velocity", 0)
     hv  = momentum.get("holder_velocity", 0)
@@ -473,8 +545,11 @@ async def fire_alert(entry: WatchlistEntry, momentum: Dict):
         f"Curve:    {cp:.1f}%  {_bar(cp)}  (+{momentum.get('curve_delta',0):.2f}%)\n"
         f"Velocity: {cv:.2f}%/min  {_bar(cv, 3)}\n"
         f"Holders:  {hc}  (+{momentum.get('holder_delta',0)} this window)\n"
-        f"H-rate:   {hv:.1f}/min · Txns: {txn}\n\n"
-        f"👨‍💻 DEV `{entry.dev_wallet[:20]}...`\n\n"
+        f"H-rate:   {hv:.1f}/min · Txns: {txn}\n"
+        f"Top wallet: {t1:.1f}%\n\n"
+        f"👨‍💻 *DEV* `{entry.dev_wallet[:20]}...`\n"
+        f"Age: {dev_age}d · Launches: {dev_toks}\n"
+        f"Flags: {risk_line}\n\n"
         f"🔗 [Pump.fun](https://pump.fun/{mint}) · "
         f"[GMGN](https://gmgn.ai/sol/token/{mint}) · "
         f"[Solscan](https://solscan.io/tx/{sig})\n"
@@ -490,22 +565,30 @@ async def fire_alert(entry: WatchlistEntry, momentum: Dict):
         except TelegramAPIError as e:
             logger.error(f"Alert to {chat_id}: {e}")
 
+    # Resolve graduation ONCE for this mint, shared across every sniper.
+    try:
+        graduated = await is_graduated(mint)
+    except Exception:
+        graduated = None
+
     snipers = await get_enabled_snipers()
     for su in snipers:
         uid = su["user_id"]
         if not await is_subscriber(uid): continue
-        asyncio.create_task(_run_snipe(uid, mint, name, symbol, momentum, su))
+        asyncio.create_task(
+            _run_snipe(uid, mint, name, symbol, momentum, su, graduated))
 
     logger.info(
         f"ALERT {name} ({mint[:12]}) MC={mc_str} "
-        f"age={age_str} curve={cp:.1f}% vel={cv:.2f}%/min"
+        f"age={age_str} curve={cp:.1f}% vel={cv:.2f}%/min grad={graduated}"
     )
 
 async def _run_snipe(user_id: int, mint: str, name: str,
-                     symbol: str, momentum: Dict, su: Dict):
-    """Calls new execute_user_buy which takes momentum dict."""
+                     symbol: str, momentum: Dict, su: Dict,
+                     graduated: Optional[bool] = None):
+    """Calls execute_user_buy with the pre-resolved graduation flag."""
     ok, sig, method, buy_sol, exit_mode = await execute_user_buy(
-        user_id, mint, name, symbol, momentum)
+        user_id, mint, name, symbol, momentum, graduated=graduated)
     profile    = RISK_PROFILES[su["risk_profile"]]
     mode_label = {"momentum": "🔥 Momentum", "steady": "📈 Trailing",
                   "weak": "💤 Fixed TP/SL"}.get(exit_mode, exit_mode)
@@ -526,7 +609,7 @@ async def _run_snipe(user_id: int, mint: str, name: str,
 def _extract_launch(tx: Dict) -> Optional[Tuple[str, str]]:
     if tx.get("type") != "CREATE": return None
     dev = tx.get("feePayer", "")
-    # tokenTransfers FIRST — the Quicknode stream filter explicitly
+    # tokenTransfers FIRST — the Helius stream filter explicitly
     # identified this address as the mint ending in "pump".
     # accountData contains ALL keys including bonding curve PDAs
     # which can also end in "pump" and would be selected incorrectly.
@@ -547,12 +630,17 @@ async def process_payload(payload: list):
     if not isinstance(payload, list): return
     for tx in payload:
         # ── Slot-based freshness gate ─────────────────────────────────────
-        # Quicknode stream delivers backfill on reconnect.
-        # Any transaction with a slot older than startup gets dropped.
+        # Helius/stream backfill on reconnect: drop anything older than startup.
         tx_slot = tx.get("slot", 0)
         if _startup_slot > 0 and tx_slot > 0:
             if tx_slot < (_startup_slot - MAX_COIN_AGE_SLOTS):
                 continue  # stale block from backfill
+
+        # ── Timestamp freshness gate (zero cost) ──────────────────────────
+        ts = tx.get("timestamp", 0)
+        if ts and isinstance(ts, (int, float)) and ts > 1_000_000_000:
+            if time.time() - ts > FRESHNESS_MAX_SECS:
+                continue
 
         result = _extract_launch(tx)
         if not result: continue
@@ -560,13 +648,12 @@ async def process_payload(payload: list):
         if mint in watchlist or await already_seen(mint): continue
         await mark_seen(mint)
 
-        # Fetch metadata and dev history in parallel
-        meta, dev = await asyncio.gather(
-            fetch_token_metadata(mint),
-            fetch_dev_history(dev_wallet),
-        )
+        # Metadata: webhook first (free), DAS only if the payload lacked a name.
+        meta = await fetch_token_metadata(mint, tx)
 
-        rug_risk, risk_flags = pre_filter_rug(meta, dev)
+        # Dev history is DEFERRED to alert time — most coins never pass, so we
+        # don't spend 3 calls/launch enriching a wallet we'll never show.
+        rug_risk, risk_flags = pre_filter_rug(meta, {})
 
         # Record first buyers for blacklist (fire and forget, limit 5)
         for acct in list(tx.get("accountData", []))[:5]:
@@ -583,7 +670,7 @@ async def process_payload(payload: list):
         watchlist[mint] = WatchlistEntry(
             mint=mint, dev_wallet=dev_wallet,
             tx_sig=tx.get("signature", ""),
-            added_at=time.time(), meta=meta, dev=dev,
+            added_at=time.time(), meta=meta, dev={},
             rug_risk=rug_risk, risk_flags=risk_flags,
         )
         logger.info(f"Watchlist +{name} ({mint[:12]}) slot={tx_slot}")
@@ -596,7 +683,8 @@ def _kb_main(subscribed: bool) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [btn, InlineKeyboardButton(text="📊 Watchlist", callback_data="wl")],
         [InlineKeyboardButton(text="🔫 Sniper", callback_data="sniper_menu"),
-         InlineKeyboardButton(text="ℹ️ How it works", callback_data="help")],
+         InlineKeyboardButton(text="ℹ️ How It Works", callback_data="help")],
+        [InlineKeyboardButton(text="📋 All Commands", callback_data="cmds")],
     ])
 
 def _kb_sniper(user: Optional[Dict]) -> InlineKeyboardMarkup:
@@ -642,12 +730,51 @@ WELCOME = (
     "High signal. No noise. Early entries only."
 )
 
+COMMANDS = (
+    "📋 *CLEX Command Reference*\n"
+    "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    "*General*\n"
+    "/start — Open the main control panel\n"
+    "/commands — Show this reference\n"
+    "/stats — Live network statistics\n\n"
+    "*Trading*\n"
+    "/performance — Your full trading scorecard\n"
+    "/sell — List open positions & stage an exit\n"
+    "/sellconfirm — Confirm the staged manual exit\n\n"
+    "*Sniper* — via the 🔫 menu\n"
+    "• Set up wallet & risk profile\n"
+    "• Toggle automation on / off\n"
+    "• Set a custom per-trade size\n"
+    "• View open positions\n"
+    "• Delete wallet\n\n"
+    "_Start as low as ~$5 — sizing scales with your balance._"
+)
+
 # ── HANDLERS ──────────────────────────────────────────────────────────────────
 @router.message(Command("start"))
 async def cmd_start(m: Message):
     sub = await is_subscriber(m.from_user.id)
     await m.answer(WELCOME, reply_markup=_kb_main(sub),
                    parse_mode=ParseMode.MARKDOWN)
+
+@router.message(Command("commands"))
+async def cmd_commands(m: Message):
+    await m.answer(COMMANDS, parse_mode=ParseMode.MARKDOWN,
+                   disable_web_page_preview=True)
+
+@router.message(Command("help"))
+async def cmd_help_command(m: Message):
+    await m.answer(COMMANDS, parse_mode=ParseMode.MARKDOWN,
+                   disable_web_page_preview=True)
+
+@router.callback_query(F.data == "cmds")
+async def cb_cmds(q: CallbackQuery):
+    await q.answer()
+    await q.message.edit_text(
+        COMMANDS,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Back", callback_data="back")]]),
+        parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
 
 @router.callback_query(F.data == "sub")
 async def cb_sub(q: CallbackQuery):
@@ -696,7 +823,7 @@ async def cb_help(q: CallbackQuery):
     await q.message.edit_text(
         "🔬 *How CLEX Works*\n\n"
         "Every pump.fun launch is detected at the moment of creation.\n\n"
-        "Every 15 seconds, each coin is scored on:\n\n"
+        "On an adaptive cadence (10s in the first minute), each coin is scored on:\n\n"
         "• Bonding curve velocity ≥ 0.4%/min\n"
         "• Holder count ≥ 12 and growing by ≥ 2\n"
         "• Top wallet concentration < 50%\n"
@@ -708,7 +835,7 @@ async def cb_help(q: CallbackQuery):
 
 @router.message(Command("stats"))
 async def cmd_stats(m: Message):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
         subs = (await (await db.execute(
             "SELECT COUNT(*) FROM subscribers")).fetchone())[0]
         seen = (await (await db.execute(
@@ -718,7 +845,8 @@ async def cmd_stats(m: Message):
             "WHERE sniper_enabled=1")).fetchone())[0]
     recent = sum(1 for t in alert_times if time.time() - t < 3600)
     await m.answer(
-        f"📊 *Stats*\n\n"
+        f"📊 *Network Stats*\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"Subscribers: {subs}\n"
         f"Tokens scanned: {seen}\n"
         f"Active snipers: {snip}\n"
@@ -738,7 +866,8 @@ async def cmd_performance(m: Message):
         for r in stats.get("recent", [])
     ]
     await m.answer(
-        f"📊 *Performance*\n\n"
+        f"📊 *Performance*\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"Trades: {stats['total']} · Win rate: {stats['win_rate']}%\n"
         f"Total PnL: {stats['total_pnl']:+.4f} SOL\n"
         f"Avg win: +{stats['avg_win_pct']:.1f}% · "
@@ -900,7 +1029,8 @@ async def cb_custom_amount(q: CallbackQuery):
     await q.answer()
     await q.message.edit_text(
         f"💰 *Custom Trade Amount*\n\nCurrent: {current}\n\n"
-        "Send the SOL amount per trade (e.g. `0.05`).",
+        "Send the SOL amount per trade (e.g. `0.05`).\n"
+        "_Tip: ~$5 ≈ a small fraction of 1 SOL — size to your wallet._",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🔄 Profile Default",
                                   callback_data="sniper_clear_custom")],
@@ -1030,6 +1160,19 @@ async def lifespan(app: FastAPI):
     set_alert_callback(sniper_message_callback)
     await bot.delete_webhook(drop_pending_updates=True)
 
+    # Register the Telegram command menu (the “/” autocomplete list).
+    try:
+        await bot.set_my_commands([
+            BotCommand(command="start",       description="Open the main panel"),
+            BotCommand(command="commands",    description="Show all commands"),
+            BotCommand(command="stats",       description="Live network statistics"),
+            BotCommand(command="performance", description="Your trading scorecard"),
+            BotCommand(command="sell",        description="Stage a manual position exit"),
+            BotCommand(command="sellconfirm", description="Confirm pending manual exit"),
+        ])
+    except Exception as e:
+        logger.warning(f"set_my_commands failed: {e}")
+
     # Capture startup slot for freshness gating
     slot_result = await rpc("getSlot", [])
     if slot_result:
@@ -1037,7 +1180,7 @@ async def lifespan(app: FastAPI):
         logger.info(f"Startup slot: {_startup_slot} — freshness gate active")
 
     await asyncio.sleep(2)
-    logger.info("CLEX ready — Quicknode stream active")
+    logger.info("CLEX ready — Helius stream active")
     asyncio.create_task(watchlist_loop())
     asyncio.create_task(position_monitor_loop())
     poll = asyncio.create_task(
@@ -1055,7 +1198,7 @@ app = FastAPI(lifespan=lifespan)
 @app.post("/webhook")
 async def webhook(req: Request):
     payload = await req.json()
-    # Log first tx structure once so we can see exact Quicknode format
+    # Log first tx structure once so we can see exact Helius format
     if isinstance(payload, list) and payload:
         tx = payload[0]
         logger.warning(f"PAYLOAD_KEYS: {list(tx.keys())}")
