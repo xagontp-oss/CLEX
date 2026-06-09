@@ -1,5 +1,5 @@
 """
-CLEX — pump.fun callout + sniper bot.
+CLEX — pump.fun callout + sniper bot
 Helius webhook delivery. Proven binary conviction gate.
 
 Efficiency build (Helius-credit conscious):
