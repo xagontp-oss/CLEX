@@ -112,7 +112,7 @@ BURN_OWNERS = {
 }
 LOCK_PROGRAMS = {
     "strmRqUCoQUgGUan5YhzUZa6KqdzwX5L6FpUxfmKg5m",   # Streamflow
-    "LocpQgucEQHbqNABEYvBvwoxCPsSbG91A1QaQhQQqjA",   # Raydium liquidity locker
+    "LockrWmn6K5twhz3y9w1dQERbmgSaRkfnTeTKbpofwE",   # Raydium Burn & Earn / LP Lock (per docs.raydium.io)
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
