@@ -8,3 +8,4 @@ pydantic==2.5.3
 solders==0.21.0
 base58==2.1.1
 cryptography==42.0.0
+segno==1.6.1

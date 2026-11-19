@@ -24,7 +24,7 @@ from aiogram import F, Router
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.filters import Command, Filter
-from aiogram.types import (CallbackQuery, InlineKeyboardButton,
+from aiogram.types import (BufferedInputFile, CallbackQuery, InlineKeyboardButton,
                            InlineKeyboardMarkup, Message)
 
 import sniper as sn
@@ -1482,25 +1482,64 @@ async def cmd_hist(m: Message):
     await _send(m, t, kb)
 
 
+SEND_FEE_LAMPORTS = 5_000
+RENT_MIN_LAMPORTS = 890_880            # a system account must hold 0 or >= this after a transfer
+OPEN_POS_RESERVE = 10_000_000          # 0.01 SOL kept for exit gas while positions are open
+WD_TTL = 300                           # a staged withdrawal expires after 5 minutes
+_wd: Dict[int, Dict] = {}
+
+
+def valid_address(addr: str) -> bool:
+    try:
+        return len(base58.b58decode(addr.strip())) == 32
+    except Exception:
+        return False
+
+
+def parse_amount(text: str, balance: int, reserve: int = 0) -> Tuple[int, str]:
+    """Returns (lamports, error). 'max' sends everything except fee + reserve."""
+    t = text.strip().lower()
+    if t in ("max", "all"):
+        lam = balance - SEND_FEE_LAMPORTS - reserve
+    else:
+        try:
+            lam = int(round(float(t) * 1e9))
+        except ValueError:
+            return 0, "Send a number like <code>0.25</code>, or <code>max</code>."
+    if lam <= 0:
+        return 0, "Nothing to send after the network fee" + (" and the gas reserve." if reserve else ".")
+    left = balance - lam - SEND_FEE_LAMPORTS
+    if left < reserve:
+        return 0, (f"That leaves too little. Max you can send is "
+                   f"<b>{max(0, balance - SEND_FEE_LAMPORTS - reserve) / 1e9:.6f} SOL</b>.")
+    if 0 < left < RENT_MIN_LAMPORTS:
+        return 0, ("That would leave a dust balance Solana won't allow. Send <code>max</code> "
+                   "or leave at least 0.001 SOL.")
+    return lam, ""
+
+
 async def _wallet_page(uid: int) -> Tuple[str, InlineKeyboardMarkup]:
     w = await _wallet(uid)
     if w:
         bal = await sn.get_sol_balance(w["pubkey"])
         px = await sol_usd()
-        text = (f"<b>👛 Wallet</b>\n{RULE}\n<code>{w['pubkey']}</code>\n\n"
+        text = (f"<b>👛 Your Apex wallet</b>\n{RULE}\n<code>{w['pubkey']}</code>\n\n"
                 f"Balance  <b>{bal:.4f} SOL</b>" + (f"  ≈ ${bal * px:,.2f}" if px else "") +
-                "\n\nKeep only what you're willing to trade in here. "
-                "Apex halts new entries if it drops below $4 so exits can always pay gas.")
-        return text, _kb([[("🗑 Disconnect wallet", "ax:wdisc")], HOME_BTN])
-    text = (f"<b>👛 Connect a wallet</b>\n{RULE}\n"
-            "Apex trades from a <b>dedicated Phantom account</b>.\n\n"
-            "1. In Phantom, create a <b>new account</b> (e.g. “Apex”)\n"
-            "2. Send it only what you're ready to trade\n"
-            "3. Phantom → Settings → Manage Accounts → <i>Show private key</i>\n"
-            "4. Send that key here — the message is deleted instantly and the key is "
-            "stored AES-encrypted\n\n"
-            "⚠️ <b>Never use your main wallet.</b> Anyone who gets a private key controls the funds.")
-    return text, _kb([[("🔐 Connect wallet", "ax:wconnect")], HOME_BTN])
+                "\n\nKeep only what you're willing to trade in here. Apex halts new entries "
+                "below $4 so exits can always pay gas.")
+        return text, _kb([[("📥 Deposit", "ax:dep"), ("📤 Send funds", "ax:send")],
+                          [("🔑 Export key", "ax:wexp"), ("🗑 Disconnect", "ax:wdisc")],
+                          [("↻ Refresh", "ax:wallet")], HOME_BTN])
+    text = (f"<b>👛 Set up your wallet</b>\n{RULE}\n"
+            "Apex trades from its own Solana wallet. Pick one:\n\n"
+            "<b>✨ Create a new wallet</b> <i>(recommended)</i>\n"
+            "Apex generates a fresh wallet. You fund it from Phantom or anywhere else — "
+            "no keys to hunt for.\n\n"
+            "<b>🔐 Import a key</b>\n"
+            "Use a dedicated Phantom account's private key. Never your main wallet.\n\n"
+            "⚠️ Either way, the bot holds the key (AES-encrypted). Only fund what you can afford to lose.")
+    return text, _kb([[("✨ Create new wallet", "ax:wcreate")],
+                      [("🔐 Import a private key", "ax:wconnect")], HOME_BTN])
 
 
 @router.callback_query(F.data == "ax:wallet")
@@ -1517,11 +1556,116 @@ async def cb_wconnect(q: CallbackQuery):
                 _kb([[("Cancel", "ax:home")]]))
 
 
+def _qr_png(data: str) -> Optional[bytes]:
+    try:
+        import io
+        import segno
+        buf = io.BytesIO()
+        segno.make(data, error="m").save(buf, kind="png", scale=8, border=2)
+        return buf.getvalue()
+    except Exception as e:
+        logger.warning(f"qr failed: {e}")
+        return None
+
+
+@router.callback_query(F.data == "ax:wcreate")
+async def cb_wcreate(q: CallbackQuery):
+    uid = q.from_user.id
+    if await _wallet(uid):
+        t, kb = await _wallet_page(uid)
+        await _send(q, "You already have a wallet connected.\n\n" + t, kb)
+        return
+    from solders.keypair import Keypair
+    kp = Keypair()
+    pub = str(kp.pubkey())
+    await sn.save_sniper_user(uid, base58.b58encode(bytes(kp)).decode(), pub, "low")
+    await _send(q, (f"<b>✨ Wallet created</b>\n{RULE}\n<code>{pub}</code>\n\n"
+                    "Next:\n1. <b>Export your key now</b> and save it in a password manager — "
+                    "it's your only way to recover the funds if the bot is ever unavailable.\n"
+                    "2. <b>Deposit SOL</b> to this address (Solana network only).\n"
+                    "3. Press ▶ START SNIPER."),
+                _kb([[("🔑 Export my key", "ax:wexp"), ("📥 Deposit", "ax:dep")], HOME_BTN]))
+
+
+@router.callback_query(F.data == "ax:dep")
+async def cb_dep(q: CallbackQuery):
+    w = await _wallet(q.from_user.id)
+    if not w:
+        t, kb = await _wallet_page(q.from_user.id)
+        await _send(q, t, kb)
+        return
+    bal = await sn.get_sol_balance(w["pubkey"])
+    caption = (f"<b>📥 Deposit SOL</b>\n{RULE}\nSend SOL to:\n<code>{w['pubkey']}</code>\n"
+               "<i>(tap the address to copy)</i>\n\n"
+               f"Balance now: <b>{bal:.4f} SOL</b>\n\n"
+               "• <b>Solana network only</b> — other networks lose the funds\n"
+               "• Works from Phantom, Coinbase, Binance, Robinhood, or any wallet that can "
+               "send SOL on Solana\n"
+               "• Press ↻ after sending to see the new balance")
+    kb = _kb([[("↻ Check balance", "ax:dep")], [("‹ Wallet", "ax:wallet")], HOME_BTN])
+    png = _qr_png(w["pubkey"])
+    if png:
+        try:
+            await q.message.answer_photo(BufferedInputFile(png, "deposit.png"), caption=caption,
+                                         parse_mode=ParseMode.HTML, reply_markup=kb)
+            await q.answer()
+            return
+        except TelegramAPIError as e:
+            logger.warning(f"deposit photo: {e}")
+    await _send(q, caption, kb)
+
+
+@router.callback_query(F.data == "ax:wexp")
+async def cb_wexp(q: CallbackQuery):
+    if not await _wallet(q.from_user.id):
+        await q.answer("No wallet yet")
+        return
+    await _send(q, f"<b>🔑 Export private key</b>\n{RULE}\nThe key will appear in a message that "
+                   "<b>deletes itself after 60 seconds</b>.\n\n"
+                   "• Anyone who sees it controls this wallet's funds\n"
+                   "• Make sure nobody is looking at your screen\n"
+                   "• Paste it straight into a password manager",
+                _kb([[("Show my key", "ax:wexpgo")], [("Cancel", "ax:wallet")]]))
+
+
+@router.callback_query(F.data == "ax:wexpgo")
+async def cb_wexpgo(q: CallbackQuery):
+    uid = q.from_user.id
+    enc = await sn._get_enc_key(uid)
+    if not enc:
+        await q.answer("No wallet")
+        return
+    try:
+        key = sn.decrypt_key(enc)
+    except Exception:
+        await q.answer("Could not decrypt — check MASTER_ENCRYPTION_KEY", show_alert=True)
+        return
+    await q.answer()
+    msg = await q.message.answer(
+        "🔑 <b>Private key</b> — deleting in 60s\n<tg-spoiler>" + html.escape(key) + "</tg-spoiler>",
+        parse_mode=ParseMode.HTML, protect_content=True)
+    del key
+
+    async def _wipe():
+        await asyncio.sleep(60)
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+    asyncio.create_task(_wipe())
+
+
 @router.callback_query(F.data == "ax:wdisc")
 async def cb_wdisc(q: CallbackQuery):
-    await _send(q, "<b>Disconnect wallet?</b>\nThe encrypted key is deleted from Apex. "
-                   "Live open positions will stop being managed.",
-                _kb([[("Yes, delete it", "ax:wdiscgo"), ("Keep", "ax:wallet")]]))
+    w = await _wallet(q.from_user.id)
+    bal = await sn.get_sol_balance(w["pubkey"]) if w else 0.0
+    warn = (f"\n\n⚠️ This wallet holds <b>{bal:.4f} SOL</b>. Once the key is deleted from Apex, "
+            "those funds are only recoverable if you exported the key. "
+            "<b>Send them out or export first.</b>") if bal > 0.001 else ""
+    await _send(q, "<b>Disconnect wallet?</b>\nThe encrypted key is deleted from Apex and the "
+                   "sniper stops. Open positions will no longer be managed." + warn,
+                _kb([[("📤 Send funds first", "ax:send")],
+                     [("Yes, delete it", "ax:wdiscgo"), ("Keep", "ax:wallet")]]))
 
 
 @router.callback_query(F.data == "ax:wdiscgo")
@@ -1530,6 +1674,120 @@ async def cb_wdiscgo(q: CallbackQuery):
     await set_setting(q.from_user.id, paused=1)
     t, kb = await _home(q.from_user.id, "🗑 Wallet disconnected. Sniper stopped.")
     await _send(q, t, kb)
+
+
+# ── SEND FUNDS (withdraw to another wallet) ──────────────────────────────────
+@router.callback_query(F.data == "ax:send")
+async def cb_send(q: CallbackQuery):
+    uid = q.from_user.id
+    if not await _wallet(uid):
+        await q.answer("No wallet")
+        return
+    s, _ = await get_settings(uid, create=True)
+    if not s["paused"]:
+        await _send(q, f"<b>📤 Send funds</b>\n{RULE}\nStop the sniper first so a trade can't "
+                       "land in the middle of a transfer. Open positions stay protected.",
+                    _kb([[("■ Stop sniper & continue", "ax:sendstop")], [("Cancel", "ax:wallet")]]))
+        return
+    _await[uid] = "wd_addr"
+    _wd.pop(uid, None)
+    await _send(q, f"<b>📤 Send funds</b>\n{RULE}\nPaste the <b>Solana address</b> to send SOL to.\n\n"
+                   "• Must be a Solana (SOL) address — a Phantom address or an exchange's "
+                   "<i>Solana</i> deposit address\n• Transfers are irreversible\n"
+                   "• Tip: send a small test amount first",
+                _kb([[("Cancel", "ax:wallet")]]))
+
+
+@router.callback_query(F.data == "ax:sendstop")
+async def cb_sendstop(q: CallbackQuery):
+    await set_setting(q.from_user.id, paused=1)
+    await cb_send(q)
+
+
+async def _reserve_for(uid: int) -> int:
+    return OPEN_POS_RESERVE if await positions(uid, "open", 1) else 0
+
+
+async def _stage_send(target, uid: int, text: str):
+    w = await _wallet(uid)
+    d = _wd.get(uid)
+    if not w or not d:
+        return
+    bal = int(round(await sn.get_sol_balance(w["pubkey"]) * 1e9))
+    reserve = await _reserve_for(uid)
+    lam, err = parse_amount(text, bal, reserve)
+    if err:
+        await _send(target, f"❌ {err}", _kb([[("Send max", "ax:sendmax")], [("Cancel", "ax:wallet")]]))
+        return
+    d.update(lamports=lam, expires=time.time() + WD_TTL)
+    _await.pop(uid, None)
+    px = await sol_usd()
+    usd = f" (≈ ${lam / 1e9 * px:,.2f})" if px else ""
+    await _send(target, (
+        f"<b>📤 Confirm transfer</b>\n{RULE}\n"
+        f"Amount   <b>{lam / 1e9:.6f} SOL</b>{usd}\n"
+        f"Network fee  ≈ {SEND_FEE_LAMPORTS / 1e9:.6f} SOL\n"
+        f"To:\n<code>{d['dest']}</code>\n\n"
+        "Check the <b>whole address</b>. Transfers can't be undone."
+        + ("\n\n<i>0.01 SOL stays behind so open positions can still exit.</i>" if reserve else "")),
+        _kb([[("✅ Confirm & send", "ax:sendgo")], [("Cancel", "ax:wallet")]]))
+
+
+@router.callback_query(F.data == "ax:sendmax")
+async def cb_sendmax(q: CallbackQuery):
+    if q.from_user.id not in _wd:
+        await q.answer("Start again from Wallet")
+        return
+    await _stage_send(q, q.from_user.id, "max")
+
+
+@router.callback_query(F.data == "ax:sendgo")
+async def cb_sendgo(q: CallbackQuery):
+    uid = q.from_user.id
+    d = _wd.get(uid)
+    if not d or not d.get("lamports") or time.time() > d.get("expires", 0):
+        _wd.pop(uid, None)
+        await _send(q, "That transfer expired. Start again from Wallet → Send funds.",
+                    _kb([[("‹ Wallet", "ax:wallet")]]))
+        return
+    _wd.pop(uid, None)                       # one shot: a double-tap can never send twice
+    ok, sig, err = await send_sol(uid, d["dest"], d["lamports"])
+    if ok:
+        await _send(q, f"✅ <b>Sent {d['lamports'] / 1e9:.6f} SOL</b>\n{RULE}\n"
+                       f"To <code>{_short(d['dest'])}</code>\n"
+                       f"<a href=\"https://solscan.io/tx/{sig}\">View on Solscan</a>",
+                    _kb([[("‹ Wallet", "ax:wallet")], HOME_BTN]))
+    else:
+        await _send(q, f"❌ <b>Transfer failed</b>\n{html.escape(err)}\nNothing was sent.",
+                    _kb([[("‹ Wallet", "ax:wallet")]]))
+
+
+async def send_sol(uid: int, dest: str, lamports: int) -> Tuple[bool, str, str]:
+    """Plain SOL transfer from the user's Apex wallet."""
+    try:
+        from solders.hash import Hash
+        from solders.message import Message as SMessage
+        from solders.pubkey import Pubkey
+        from solders.system_program import TransferParams, transfer
+        from solders.transaction import Transaction
+        enc = await sn._get_enc_key(uid)
+        if not enc:
+            return False, "", "no wallet"
+        kp = sn.load_keypair(enc)
+        bh = await sn._rpc("getLatestBlockhash", [{"commitment": "finalized"}])
+        blockhash = Hash.from_string(bh["value"]["blockhash"])
+        ix = transfer(TransferParams(from_pubkey=kp.pubkey(), to_pubkey=Pubkey.from_string(dest),
+                                     lamports=int(lamports)))
+        tx = Transaction([kp], SMessage.new_with_blockhash([ix], kp.pubkey(), blockhash), blockhash)
+        sig = await sn.send_transaction_fast(bytes(tx), kp, False)
+        if not sig:
+            return False, "", "the network rejected the transaction"
+        if not await sn.confirm_transaction(sig, 40):
+            return False, sig, "not confirmed in time — check Solscan before retrying"
+        return True, sig, ""
+    except Exception as e:
+        logger.error(f"send_sol: {e}", exc_info=True)
+        return False, "", "unexpected error"
 
 
 async def _status_page() -> Tuple[str, InlineKeyboardMarkup]:
@@ -1632,6 +1890,26 @@ async def on_text(m: Message):
     uid = m.from_user.id
     kind = _await.get(uid)
     raw = (m.text or "").strip()
+    if kind == "wd_addr":
+        w = await _wallet(uid)
+        if not valid_address(raw):
+            await m.answer("❌ That isn't a valid Solana address. Paste it again, or cancel.",
+                           reply_markup=_kb([[("Cancel", "ax:wallet")]]))
+            return
+        if w and raw == w["pubkey"]:
+            await m.answer("That's this wallet's own address. Paste a different one.")
+            return
+        _wd[uid] = {"dest": raw}
+        _await[uid] = "wd_amt"
+        bal = await sn.get_sol_balance(w["pubkey"]) if w else 0.0
+        await m.answer(f"<b>How much?</b>\nBalance: <b>{bal:.4f} SOL</b>\n"
+                       "Send an amount like <code>0.25</code>, or tap Send max.",
+                       parse_mode=ParseMode.HTML,
+                       reply_markup=_kb([[("Send max", "ax:sendmax")], [("Cancel", "ax:wallet")]]))
+        return
+    if kind == "wd_amt":
+        await _stage_send(m, uid, raw)
+        return
     if kind == "wallet":
         try:
             await m.delete()
