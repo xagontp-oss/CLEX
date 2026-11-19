@@ -3,7 +3,7 @@ CLEX APEX — new-pool strategy engine.
 
 Detection : Helius enhanced webhook (CREATE_POOL on Raydium) -> on_pool_event()
 Screening : fail-fast, two stages (cheap on-chain checks now, confirmation at T+60s)
-Execution : Jupiter swap API (paper mode by default, live mode opt-in)
+Execution : Jupiter swap API — live trading from a connected Phantom wallet
 Exits     : four fixed profiles (A/B/C/D), hard stop, trailing stop, time stop
 Interface : Telegram pages (router) — see the PAGES section.
 """
@@ -304,9 +304,10 @@ async def init_db():
                 profile   TEXT NOT NULL DEFAULT 'B',
                 size_usd  REAL NOT NULL DEFAULT 10,
                 size_sol  REAL DEFAULT NULL,
-                mode      TEXT NOT NULL DEFAULT 'paper',
+                mode      TEXT NOT NULL DEFAULT 'live',
                 paused    INTEGER NOT NULL DEFAULT 0,
-                low_alert REAL NOT NULL DEFAULT 0
+                low_alert REAL NOT NULL DEFAULT 0,
+                risk_ack  INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS apex_positions (
                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -340,6 +341,14 @@ async def init_db():
             );
         """)
         await db.commit()
+        try:
+            await db.execute("ALTER TABLE apex_settings ADD COLUMN risk_ack INTEGER NOT NULL DEFAULT 0")
+            await db.commit()
+        except Exception:
+            pass                                    # column already exists
+        # One-time migration: paper mode is gone. Everyone starts STOPPED, in live mode.
+        await db.execute("UPDATE apex_settings SET mode='live', paused=1 WHERE mode='paper'")
+        await db.commit()
         cur = await db.execute("SELECT mint FROM apex_blacklist")
         _blacklist.update(r[0] for r in await cur.fetchall())
     logger.info(f"Apex DB ready — {len(_blacklist)} blacklisted tokens loaded")
@@ -362,7 +371,7 @@ async def get_settings(uid: int, create: bool = False) -> Tuple[Optional[Dict], 
             return dict(row), False
         if not create:
             return None, False
-        await db.execute("INSERT INTO apex_settings(user_id) VALUES (?)", (uid,))
+        await db.execute("INSERT INTO apex_settings(user_id, paused, mode) VALUES (?,1,'live')", (uid,))
         await db.commit()
         cur = await db.execute("SELECT * FROM apex_settings WHERE user_id=?", (uid,))
         return dict(await cur.fetchone()), True
@@ -719,7 +728,7 @@ def decide_exit(profile: str, ratio: float, tiers_hit: int, peak: float,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TRADING (paper + live)
+# TRADING (live)
 # ══════════════════════════════════════════════════════════════════════════════
 _bot = None
 _halted = {"on": False, "alerted": False, "credit_alerted": False}
@@ -801,32 +810,24 @@ async def _enter_one(u: Dict, mint: str, name: str, symbol: str, dec: int, mcap:
         sol = u["size_sol"] or (u["size_usd"] / px)
         if sol * px < MIN_TRADE_USD - 0.01:
             return
-        mode = u["mode"]
-        if mode == "live":
-            w = await _wallet(uid)
-            if not w:
-                return
-            bal = await sn.get_sol_balance(w["pubkey"])
-            if bal * px < MIN_WALLET_USD:
-                if time.time() - u["low_alert"] > 3600:
-                    await set_setting(uid, low_alert=time.time())
-                    await _notify(uid, "⚠️ <b>Wallet running low</b>\n"
-                                       f"Balance is {bal:.4f} SOL — below the ${MIN_WALLET_USD:.0f} "
-                                       "reserve. New entries are paused so exits can still pay gas.")
-                return
-            if bal < sol + 0.004:
-                return
-            ok, tokens, sig, err = await _live_buy(uid, mint, sol, dec)
-            if not ok:
-                logger.warning(f"live buy failed {mint[:8]}: {err}")
-                return
-        else:
-            q = await jup_quote(WSOL, mint, int(sol * 1e9), ENTRY_SLIPPAGE_BPS)
-            if not q:
-                return
-            tokens = int(q["outAmount"]) / 10 ** dec
-            sig = "paper"
-            sol += PAPER_FEE_SOL
+        mode = "live"
+        w = await _wallet(uid)
+        if not w:
+            return
+        bal = await sn.get_sol_balance(w["pubkey"])
+        if bal * px < MIN_WALLET_USD:
+            if time.time() - u["low_alert"] > 3600:
+                await set_setting(uid, low_alert=time.time())
+                await _notify(uid, "⚠️ <b>Wallet running low</b>\n"
+                                   f"Balance is {bal:.4f} SOL — below the ${MIN_WALLET_USD:.0f} "
+                                   "reserve. New entries are paused so exits can still pay gas.")
+            return
+        if bal < sol + 0.004:
+            return
+        ok, tokens, sig, err = await _live_buy(uid, mint, sol, dec)
+        if not ok:
+            logger.warning(f"live buy failed {mint[:8]}: {err}")
+            return
         if tokens <= 0:
             return
         entry_price = sol / tokens
@@ -841,7 +842,7 @@ async def _enter_one(u: Dict, mint: str, name: str, symbol: str, dec: int, mcap:
             await db.commit()
         _stats["entries"] += 1
         prof = PROFILES[u["profile"]]
-        tag = "🧪 PAPER" if mode == "paper" else "🔴 LIVE"
+        tag = "🔴 LIVE"
         await _notify(uid, (
             f"🎯 <b>Position opened</b>  ·  {tag}\n"
             f"━━━━━━━━━━━━━━━\n"
@@ -1049,7 +1050,7 @@ async def pump_pipeline(pool: Pool):
             wait = pool.ts + age - time.time()
             if wait > 0:
                 await asyncio.sleep(wait)
-            if not await _budget_ok():
+            if not await _budget_ok() or not await _active_users():
                 return
             last = i == len(PUMP_CHECK_AGES) - 1
             async with _pipeline_sem:
@@ -1199,20 +1200,23 @@ async def _home(uid: int, banner: str = "") -> Tuple[str, InlineKeyboardMarkup]:
     w = await _wallet(uid)
     px = await sol_usd()
     size = (f"{s['size_sol']:g} SOL" if s["size_sol"] else f"${s['size_usd']:g}")
-    live = s["mode"] == "live"
-    if w and live:
+    if w:
         bal = await sn.get_sol_balance(w["pubkey"])
         wal = f"{_short(w['pubkey'])} · {bal:.3f} SOL"
     else:
-        wal = f"{_short(w['pubkey'])} · connected" if w else "not connected"
+        wal = "not connected"
     opened = await positions(uid, "open", 100)
-    scanning = (not s["paused"]) and not _halted["on"]
-    state = "● Scanning" if scanning else ("⏸ Paused" if s["paused"] else "◌ Feed quiet")
+    running = not s["paused"]
+    if not running:
+        state = "■ STOPPED"
+    elif _halted["on"]:
+        state = "◌ RUNNING · feed quiet"
+    else:
+        state = "● RUNNING · hunting"
     text = (
         (f"{banner}\n\n" if banner else "") +
-        f"<b>◆ CLEX APEX</b>\n<i>Precision entries on fresh Solana pools.</i>\n{RULE}\n"
-        f"<code>Engine   </code>{state}\n"
-        f"<code>Mode     </code>{'🔴 Live trading' if live else '🧪 Paper (practice)'}\n"
+        f"<b>◆ CLEX APEX</b>\n<i>Precision entries on fresh Solana launches.</i>\n{RULE}\n"
+        f"<code>Sniper   </code><b>{state}</b>\n"
         f"<code>Exit     </code>{prof['icon']} {prof['name']}\n"
         f"<code>Size     </code>{size}"
         + (f" ≈ {s['size_sol'] * px:.2f} USD" if s["size_sol"] and px else "") + "\n"
@@ -1220,25 +1224,25 @@ async def _home(uid: int, banner: str = "") -> Tuple[str, InlineKeyboardMarkup]:
         f"<code>Open     </code>{len(opened)} position{'s' if len(opened) != 1 else ''}\n"
         f"{RULE}\n"
         "<i>Roughly 95% of launches never pass the gauntlet. That's the edge.</i>")
-    pause_btn = ("▶ Resume", "ax:resume") if s["paused"] else ("⏸ Pause", "ax:pause")
+    toggle = [("■ STOP SNIPER", "ax:stop")] if running else [("▶ START SNIPER", "ax:start")]
     kb = _kb([
+        toggle,
         [("🎯 Positions", "ax:pos"), ("📜 History", "ax:hist")],
         [("🧭 Strategy", "ax:strat"), ("💵 Size", "ax:size")],
-        [("👛 Wallet", "ax:wallet"), ("🧪 Mode", "ax:mode")],
-        [pause_btn, ("📡 Status", "ax:stat")],
+        [("👛 Wallet", "ax:wallet"), ("📡 Status", "ax:stat")],
         [("🚫 Blacklist", "ax:bl"), ("📖 How it works", "ax:how")],
     ])
     return text, kb
 
 
 WELCOME = (
-    "<b>◆ CLEX APEX</b>\n<i>Precision entries on fresh Solana pools.</i>\n" + RULE + "\n"
-    "Apex watches every new liquidity pool, throws out the junk, and only moves "
-    "when a launch clears <b>every</b> safety gate. Then it manages the exit for you — "
-    "targets, stops, all of it.\n\n"
-    "You start in <b>Paper mode</b>: real signals, real prices, zero risk. "
-    "Go live when you trust it.\n\n"
-    "<b>Two quick choices</b> and you're running:")
+    "<b>◆ CLEX APEX</b>\n<i>Precision entries on fresh Solana launches.</i>\n" + RULE + "\n"
+    "Apex watches every new launch, throws out the junk, and only moves when a coin "
+    "clears <b>every</b> safety gate. Then it manages the exit for you — targets, "
+    "stops, all of it.\n\n"
+    "It trades <b>real SOL</b> from a dedicated Phantom wallet, but only while you "
+    "have it <b>started</b>. Nothing happens until you press ▶ START.\n\n"
+    "<b>Three quick steps:</b> exit strategy, trade size, wallet.")
 
 
 async def _strategy_page() -> Tuple[str, InlineKeyboardMarkup]:
@@ -1325,8 +1329,8 @@ async def cb_sz(q: CallbackQuery):
     await set_setting(q.from_user.id, size_usd=v, size_sol=None)
     done = q.from_user.id in _wizard
     _wizard.discard(q.from_user.id)
-    banner = ("🎉 <b>You're live on Apex — in Paper mode.</b> Watch the signals roll in, "
-              "then go live from 🧪 Mode." if done else f"✅ Size set to <b>${v:g}</b> per trade.")
+    banner = ("🎉 <b>Almost there.</b> Connect your wallet, then press ▶ START SNIPER."
+              if done else f"✅ Size set to <b>${v:g}</b> per trade.")
     t, kb = await _home(q.from_user.id, banner)
     await _send(q, t, kb)
 
@@ -1338,34 +1342,77 @@ async def cb_szc(q: CallbackQuery):
                 "<code>0.05</code>.", _kb([HOME_BTN]))
 
 
-@router.callback_query(F.data == "ax:pause")
-async def cb_pause(q: CallbackQuery):
-    await set_setting(q.from_user.id, paused=1)
-    t, kb = await _home(q.from_user.id, "⏸ <b>Paused.</b> No new entries. Open positions stay protected.")
-    await _send(q, t, kb)
+async def _do_start(uid: int, target):
+    s, _ = await get_settings(uid, create=True)
+    w = await _wallet(uid)
+    if not w:
+        t, kb = await _wallet_page(uid)
+        await _send(target, "🔐 <b>Connect a wallet first</b> — Apex needs a funded Phantom "
+                            "account to trade from.\n\n" + t, kb)
+        return
+    px = await sol_usd()
+    bal = await sn.get_sol_balance(w["pubkey"])
+    size_sol = s["size_sol"] or ((s["size_usd"] / px) if px else 0)
+    need = size_sol + 0.004 + (MIN_WALLET_USD / px if px else 0)
+    if bal < need:
+        await _send(target, f"<b>💸 Fund your wallet first</b>\n{RULE}\n"
+                            f"Balance <b>{bal:.4f} SOL</b> · needed about <b>{need:.4f} SOL</b>\n"
+                            "(one trade + fees + the $4 gas reserve).\n\n"
+                            f"Send SOL to:\n<code>{w['pubkey']}</code>",
+                    _kb([[("↻ Check again", "ax:start")], HOME_BTN]))
+        return
+    if not s["risk_ack"]:
+        await _send(target, f"<b>▶ Start sniping?</b>\n{RULE}\nApex will spend <b>real SOL</b> from "
+                            f"<code>{_short(w['pubkey'])}</code>, automatically, with no confirmation "
+                            "per trade.\n\n"
+                            "• Memecoins can go to zero — the −45% stop cannot guarantee an exit\n"
+                            "• Press ■ STOP any time: no new entries, open positions stay protected\n"
+                            "• Only fund the wallet with money you can lose",
+                    _kb([[("I understand — START", "ax:startgo")], [("Cancel", "ax:home")]]))
+        return
+    await set_setting(uid, paused=0)
+    t, kb = await _home(uid, "▶ <b>Sniper started.</b> Apex is hunting and will place trades "
+                             "when a launch clears every gate.")
+    await _send(target, t, kb)
 
 
-@router.callback_query(F.data == "ax:resume")
-async def cb_resume(q: CallbackQuery):
-    await set_setting(q.from_user.id, paused=0)
-    t, kb = await _home(q.from_user.id, "▶ <b>Scanning.</b> Apex is hunting.")
-    await _send(q, t, kb)
+@router.callback_query(F.data == "ax:start")
+async def cb_start(q: CallbackQuery):
+    await _do_start(q.from_user.id, q)
 
 
-@router.message(Command("pause"))
-async def cmd_pause(m: Message):
-    await get_settings(m.from_user.id, create=True)
-    await set_setting(m.from_user.id, paused=1)
-    t, kb = await _home(m.from_user.id, "⏸ <b>Paused.</b> No new entries. Open positions stay protected.")
-    await _send(m, t, kb)
+@router.callback_query(F.data == "ax:startgo")
+async def cb_startgo(q: CallbackQuery):
+    if not await _wallet(q.from_user.id):
+        await q.answer("Connect a wallet first")
+        return
+    await set_setting(q.from_user.id, risk_ack=1)
+    await _do_start(q.from_user.id, q)
 
 
+async def _do_stop(uid: int, target):
+    await get_settings(uid, create=True)
+    await set_setting(uid, paused=1)
+    t, kb = await _home(uid, "■ <b>Sniper stopped.</b> No new entries. Open positions stay "
+                             "protected — stops and targets keep running.")
+    await _send(target, t, kb)
+
+
+@router.callback_query(F.data == "ax:stop")
+async def cb_stop(q: CallbackQuery):
+    await _do_stop(q.from_user.id, q)
+
+
+@router.message(Command("run"))
 @router.message(Command("resume"))
-async def cmd_resume(m: Message):
-    await get_settings(m.from_user.id, create=True)
-    await set_setting(m.from_user.id, paused=0)
-    t, kb = await _home(m.from_user.id, "▶ <b>Scanning.</b> Apex is hunting.")
-    await _send(m, t, kb)
+async def cmd_run(m: Message):
+    await _do_start(m.from_user.id, m)
+
+
+@router.message(Command("stop"))
+@router.message(Command("pause"))
+async def cmd_stop(m: Message):
+    await _do_stop(m.from_user.id, m)
 
 
 async def _positions_page(uid: int) -> Tuple[str, InlineKeyboardMarkup]:
@@ -1384,7 +1431,7 @@ async def _positions_page(uid: int) -> Tuple[str, InlineKeyboardMarkup]:
             floor = f"trail {(p['peak_ratio'] * TRAIL_KEEP - 1) * 100:+.0f}%"
         else:
             floor = "stop −45%"
-        tag = "🧪" if p["mode"] == "paper" else "🔴"
+        tag = "🧪" if p["mode"] == "paper" else ""
         out.append(
             f"\n{dot} <b>{html.escape(p['name'] or p['mint'][:6])}</b> "
             f"<code>${html.escape(p['symbol'] or '?')}</code> {tag}\n"
@@ -1480,52 +1527,8 @@ async def cb_wdisc(q: CallbackQuery):
 @router.callback_query(F.data == "ax:wdiscgo")
 async def cb_wdiscgo(q: CallbackQuery):
     await sn.delete_sniper_user(q.from_user.id)
-    await set_setting(q.from_user.id, mode="paper")
-    t, kb = await _home(q.from_user.id, "🗑 Wallet disconnected. Back in Paper mode.")
-    await _send(q, t, kb)
-
-
-@router.callback_query(F.data == "ax:mode")
-async def cb_mode(q: CallbackQuery):
-    s, _ = await get_settings(q.from_user.id, create=True)
-    if s["mode"] == "live":
-        await _send(q, f"<b>🧪 Mode</b>\n{RULE}\nCurrently <b>🔴 Live</b> — real SOL, real swaps.",
-                    _kb([[("Switch to Paper", "ax:paper")], HOME_BTN]))
-        return
-    await _send(q, f"<b>🧪 Mode</b>\n{RULE}\nCurrently <b>Paper</b> — Apex simulates every trade "
-                   "at live Jupiter prices. Nothing real is spent.\n\n"
-                   "Go live only after you've watched it work.",
-                _kb([[("🔴 Go live…", "ax:live")], HOME_BTN]))
-
-
-@router.callback_query(F.data == "ax:paper")
-async def cb_paper(q: CallbackQuery):
-    await set_setting(q.from_user.id, mode="paper")
-    t, kb = await _home(q.from_user.id, "🧪 Switched to <b>Paper</b>.")
-    await _send(q, t, kb)
-
-
-@router.callback_query(F.data == "ax:live")
-async def cb_live(q: CallbackQuery):
-    if not await _wallet(q.from_user.id):
-        t, kb = await _wallet_page(q.from_user.id)
-        await _send(q, "Connect a wallet first.\n\n" + t, kb)
-        return
-    await _send(q, f"<b>🔴 Go live?</b>\n{RULE}\nApex will spend <b>real SOL</b> from your connected "
-                   "wallet, automatically, with no confirmation per trade.\n\n"
-                   "• Memecoins can go to zero — the −45% stop cannot guarantee an exit\n"
-                   "• You can pause or switch back to Paper at any time\n"
-                   "• Only fund the wallet with money you can lose",
-                _kb([[("I understand — go live", "ax:livego")], [("Cancel", "ax:mode")]]))
-
-
-@router.callback_query(F.data == "ax:livego")
-async def cb_livego(q: CallbackQuery):
-    if not await _wallet(q.from_user.id):
-        await q.answer("Connect a wallet first")
-        return
-    await set_setting(q.from_user.id, mode="live")
-    t, kb = await _home(q.from_user.id, "🔴 <b>Live.</b> Apex is trading real SOL.")
+    await set_setting(q.from_user.id, paused=1)
+    t, kb = await _home(q.from_user.id, "🗑 Wallet disconnected. Sniper stopped.")
     await _send(q, t, kb)
 
 
@@ -1613,7 +1616,7 @@ async def cmd_balance(m: Message):
 async def cmd_help(m: Message):
     await _send(m, (
         f"<b>Commands</b>\n{RULE}\n/start — home\n/positions — what's open\n"
-        "/history — last 20 trades\n/settings — exit strategy\n/pause · /resume — control scanning\n"
+        "/history — last 20 trades\n/settings — exit strategy\n/run — start sniping · /stop — stop sniping\n"
         "/balance — wallet\n/status — engine &amp; credits\n/blacklist — banned tokens"),
         _kb([HOME_BTN]))
 
@@ -1643,7 +1646,7 @@ async def on_text(m: Message):
         _await.pop(uid, None)
         bal = await sn.get_sol_balance(pub)
         t, kb = await _home(uid, f"✅ <b>Wallet connected</b> · <code>{_short(pub)}</code> · "
-                                 f"{bal:.3f} SOL\nStill in Paper mode — switch when ready.")
+                                 f"{bal:.3f} SOL\nPress ▶ START SNIPER when you're ready.")
         await m.answer(t, parse_mode=ParseMode.HTML, reply_markup=kb)
         return
     if kind == "size":
@@ -1662,7 +1665,7 @@ async def on_text(m: Message):
         _await.pop(uid, None)
         done = uid in _wizard
         _wizard.discard(uid)
-        t, kb = await _home(uid, "🎉 <b>You're set — Apex is scanning in Paper mode.</b>"
+        t, kb = await _home(uid, "🎉 <b>Almost there.</b> Connect your wallet, then press ▶ START SNIPER."
                             if done else f"✅ Size set to <b>{v:g} SOL</b> per trade.")
         await m.answer(t, parse_mode=ParseMode.HTML, reply_markup=kb)
 
@@ -1672,7 +1675,7 @@ async def on_text(m: Message):
 # ══════════════════════════════════════════════════════════════════════════════
 BOT_COMMANDS = [
     ("start", "Open Apex"), ("positions", "Open positions"), ("history", "Last 20 trades"),
-    ("settings", "Exit strategy"), ("pause", "Pause scanning"), ("resume", "Resume scanning"),
+    ("settings", "Exit strategy"), ("run", "▶ Start sniping"), ("stop", "■ Stop sniping"),
     ("balance", "Wallet balance"), ("status", "Engine & credit status"),
     ("blacklist", "Banned tokens"), ("help", "All commands"),
 ]
