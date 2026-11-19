@@ -22,7 +22,7 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 MASTER_KEY = os.getenv("MASTER_ENCRYPTION_KEY", "")
-DB_PATH    = "clex.db"
+DB_PATH    = os.getenv("DB_PATH", "clex.db")
 
 # Free public endpoint — used for confirmations and as a redundant send target.
 PUBLIC_RPC = "https://api.mainnet-beta.solana.com"

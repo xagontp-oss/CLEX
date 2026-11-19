@@ -26,7 +26,8 @@ from aiogram.types import (Message, InlineKeyboardMarkup,
 from aiogram.filters import Command
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramAPIError
-from fastapi import FastAPI, Request
+import hmac
+from fastapi import FastAPI, Request, HTTPException
 from contextlib import asynccontextmanager
 
 load_dotenv()
@@ -45,7 +46,8 @@ import sniper as sn
 
 # ── ENV ───────────────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-DB_PATH        = "clex.db"
+DB_PATH        = os.getenv("DB_PATH", "clex.db")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 
 # ── TUNING — original values that produced good callouts ─────────────────────
 WATCHLIST_TTL       = 300
@@ -1197,14 +1199,14 @@ app = FastAPI(lifespan=lifespan)
 
 @app.post("/webhook")
 async def webhook(req: Request):
+    # Helius sends the configured authHeader value in the Authorization header.
+    # Fail closed: reject everything unless a secret is configured and matches.
+    got = req.headers.get("authorization", "")
+    if got.startswith("Bearer "):
+        got = got[7:]
+    if not WEBHOOK_SECRET or not hmac.compare_digest(got, WEBHOOK_SECRET):
+        raise HTTPException(status_code=401, detail="unauthorized")
     payload = await req.json()
-    # Log first tx structure once so we can see exact Helius format
-    if isinstance(payload, list) and payload:
-        tx = payload[0]
-        logger.warning(f"PAYLOAD_KEYS: {list(tx.keys())}")
-        logger.warning(f"PAYLOAD_TYPE: {tx.get('type')}")
-        logger.warning(f"PAYLOAD_TRANSFERS: {tx.get('tokenTransfers')}")
-        logger.warning(f"PAYLOAD_ACCT_SAMPLE: {[a.get('account','')[:20] for a in tx.get('accountData',[])[:5]]}")
     asyncio.create_task(process_payload(payload))
     return {"ok": True}
 
@@ -1215,4 +1217,4 @@ async def health():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8080, access_log=False)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8080")), access_log=False)
