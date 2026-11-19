@@ -43,10 +43,13 @@ from sniper import (
     record_first_buyer, fingerprint_dev_wallet, is_graduated,
 )
 import sniper as sn
+import apex
 
 # ── ENV ───────────────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 DB_PATH        = os.getenv("DB_PATH", "clex.db")
+# The pump.fun callout engine is OFF by default: Apex owns detection and the credit budget.
+LEGACY_PUMP    = os.getenv("LEGACY_PUMP_ENGINE", "0") == "1"
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 
 # ── TUNING — original values that produced good callouts ─────────────────────
@@ -76,6 +79,7 @@ logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 bot    = Bot(token=TELEGRAM_TOKEN)
 dp     = Dispatcher()
 router = Router()
+dp.include_router(apex.router)   # Apex pages take priority
 dp.include_router(router)
 
 # ── RPC ───────────────────────────────────────────────────────────────────────
@@ -1160,18 +1164,13 @@ async def lifespan(app: FastAPI):
     await init_db()
     await init_sniper_db()
     set_alert_callback(sniper_message_callback)
+    await apex.startup(bot)
     await bot.delete_webhook(drop_pending_updates=True)
 
     # Register the Telegram command menu (the “/” autocomplete list).
     try:
-        await bot.set_my_commands([
-            BotCommand(command="start",       description="Open the main panel"),
-            BotCommand(command="commands",    description="Show all commands"),
-            BotCommand(command="stats",       description="Live network statistics"),
-            BotCommand(command="performance", description="Your trading scorecard"),
-            BotCommand(command="sell",        description="Stage a manual position exit"),
-            BotCommand(command="sellconfirm", description="Confirm pending manual exit"),
-        ])
+        await bot.set_my_commands(
+                [BotCommand(command=c, description=d) for c, d in apex.BOT_COMMANDS])
     except Exception as e:
         logger.warning(f"set_my_commands failed: {e}")
 
@@ -1182,7 +1181,7 @@ async def lifespan(app: FastAPI):
         logger.info(f"Startup slot: {_startup_slot} — freshness gate active")
 
     await asyncio.sleep(2)
-    logger.info("CLEX ready — Helius stream active")
+    logger.info(f"CLEX ready — Apex engine active (legacy pump engine: {'on' if LEGACY_PUMP else 'off'})")
     asyncio.create_task(watchlist_loop())
     asyncio.create_task(position_monitor_loop())
     poll = asyncio.create_task(
@@ -1207,7 +1206,14 @@ async def webhook(req: Request):
     if not WEBHOOK_SECRET or not hmac.compare_digest(got, WEBHOOK_SECRET):
         raise HTTPException(status_code=401, detail="unauthorized")
     payload = await req.json()
-    asyncio.create_task(process_payload(payload))
+    apex.note_webhook()
+    items = payload if isinstance(payload, list) else []
+    for tx in items:
+        t = tx.get("type")
+        if t == "CREATE_POOL":
+            asyncio.create_task(apex.on_pool_event(tx))
+        elif t == "CREATE" and LEGACY_PUMP:
+            asyncio.create_task(process_payload([tx]))
     return {"ok": True}
 
 @app.get("/")
