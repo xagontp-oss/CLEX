@@ -10,6 +10,7 @@ Interface : Telegram pages (router) — see the PAGES section.
 import asyncio
 import base64
 import html
+import json
 import logging
 import os
 import time
@@ -752,6 +753,62 @@ async def _wallet(uid: int) -> Optional[Dict]:
     return await sn.get_sniper_user(uid)
 
 
+async def _confirm_tx(sig: str, timeout_s: int = 30) -> Tuple[str, str]:
+    """('ok'|'failed'|'timeout', err). A transaction can land on-chain AND have failed
+    (e.g. slippage exceeded) — sn.confirm_transaction reports that as success, so we don't use it."""
+    deadline = time.time() + timeout_s
+    async with aiohttp.ClientSession() as s:
+        while time.time() < deadline:
+            try:
+                async with s.post(sn.PUBLIC_RPC,
+                                  json={"jsonrpc": "2.0", "id": 1, "method": "getSignatureStatuses",
+                                        "params": [[sig], {"searchTransactionHistory": False}]},
+                                  timeout=aiohttp.ClientTimeout(total=4)) as r:
+                    val = (((await r.json()).get("result") or {}).get("value") or [None])[0]
+                if val:
+                    if val.get("err"):
+                        return "failed", json.dumps(val["err"])
+                    if val.get("confirmationStatus") in ("confirmed", "finalized"):
+                        return "ok", ""
+            except Exception:
+                pass
+            await asyncio.sleep(2)
+    return "timeout", ""
+
+
+def friendly_err(err: str) -> str:
+    e = (err or "").lower()
+    if "6001" in e or "slippage" in e:
+        return "price moved too fast — slippage limit exceeded"
+    if "insufficient" in e or "0x1" in e:
+        return "not enough SOL to cover the trade and fees"
+    if "route" in e:
+        return "no route within the slippage limit"
+    if "build" in e:
+        return "couldn't build the swap"
+    if err:
+        return err
+    return "the transaction failed"
+
+
+_fail_notes: Dict[int, List[float]] = {}
+_exit_warned: Dict[int, float] = {}
+
+
+async def _notify_fail(uid: int, head: str, reason: str, sig: str = "", cost_note: str = ""):
+    """Failure alerts, capped at 8 an hour per user so a bad stretch can't flood the chat."""
+    now = time.time()
+    log = [t for t in _fail_notes.get(uid, []) if now - t < 3600]
+    if len(log) >= 8:
+        _fail_notes[uid] = log
+        return
+    log.append(now)
+    _fail_notes[uid] = log
+    link = f'\n<a href="https://solscan.io/tx/{sig}">View transaction</a>' if sig else ""
+    await _notify(uid, f"⚠️ <b>{head}</b>\n{RULE}\nReason: {html.escape(reason)}"
+                       f"{(chr(10) + cost_note) if cost_note else ''}{link}")
+
+
 async def _live_buy(uid: int, mint: str, sol: float, dec: int) -> Tuple[bool, float, str, str]:
     w = await _wallet(uid)
     enc = await sn._get_enc_key(uid)
@@ -766,11 +823,20 @@ async def _live_buy(uid: int, mint: str, sol: float, dec: int) -> Tuple[bool, fl
     kp = sn.load_keypair(enc)
     sig = await sn.send_transaction_fast(raw, kp, True)
     if not sig:
-        return False, 0.0, "", "send failed"
-    if not await sn.confirm_transaction(sig):
-        return False, 0.0, sig, "unconfirmed"
+        return False, 0.0, "", "the network rejected the transaction"
+    status, err = await _confirm_tx(sig)
+    if status == "failed":
+        return False, 0.0, sig, friendly_err(err)
+    if status == "timeout":
+        await asyncio.sleep(8)               # it may still have landed — check the wallet itself
     bal = await sn.get_token_balance(w["pubkey"], mint)
-    return True, bal or int(q["outAmount"]) / 10 ** dec, sig, ""
+    if bal <= 0 and status == "ok":
+        await asyncio.sleep(3)
+        bal = await sn.get_token_balance(w["pubkey"], mint)
+    if bal <= 0:
+        return False, 0.0, sig, ("not confirmed in time and no tokens arrived" if status == "timeout"
+                                 else "confirmed but no tokens arrived")
+    return True, bal, sig, ""
 
 
 async def _sell(pos: Dict, tokens: float) -> Tuple[bool, float, str]:
@@ -791,8 +857,11 @@ async def _sell(pos: Dict, tokens: float) -> Tuple[bool, float, str]:
     if not raw:
         return False, 0.0, ""
     sig = await sn.send_transaction_fast(raw, sn.load_keypair(enc), True)
-    if not sig or not await sn.confirm_transaction(sig):
-        return False, 0.0, sig or ""
+    if not sig:
+        return False, 0.0, ""
+    status, _err = await _confirm_tx(sig)
+    if status != "ok":
+        return False, 0.0, sig
     return True, sol_out, sig
 
 
@@ -823,10 +892,17 @@ async def _enter_one(u: Dict, mint: str, name: str, symbol: str, dec: int, mcap:
                                    "reserve. New entries are paused so exits can still pay gas.")
             return
         if bal < sol + 0.004:
+            await _notify_fail(uid, f"Buy skipped — {name}",
+                               f"wallet has {bal:.4f} SOL, a trade needs about {sol + 0.004:.4f}",
+                               cost_note="Top up the wallet to keep sniping.")
             return
         ok, tokens, sig, err = await _live_buy(uid, mint, sol, dec)
         if not ok:
             logger.warning(f"live buy failed {mint[:8]}: {err}")
+            await _notify_fail(
+                uid, f"Buy didn't go through — {name}", err, sig,
+                "A failed on-chain attempt costs only the network fee." if sig else
+                "No SOL was spent.")
             return
         if tokens <= 0:
             return
@@ -934,6 +1010,13 @@ async def _manage(pos: Dict):
         for kind, frac, reason, tier in d["actions"]:
             amt = tokens if kind == "all" else cur["tokens_left"] * frac
             if not await _close_or_reduce(cur, amt, reason, tier, kind == "all"):
+                if time.time() - _exit_warned.get(pos["id"], 0) > 300:
+                    _exit_warned[pos["id"]] = time.time()
+                    await _notify(pos["user_id"],
+                                  f"⚠️ <b>Exit didn't go through</b> — "
+                                  f"{html.escape(pos['name'] or pos['mint'][:6])}\n"
+                                  f"Trigger: <code>{reason}</code>. The sell failed (usually slippage "
+                                  "or a congested network). Apex is retrying every 30 seconds.")
                 break
             cur = (await positions(pos["user_id"], "open", 100) or [None])
             cur = next((p for p in cur if p and p["id"] == pos["id"]), None)
@@ -1783,7 +1866,10 @@ async def send_sol(uid: int, dest: str, lamports: int) -> Tuple[bool, str, str]:
         sig = await sn.send_transaction_fast(bytes(tx), kp, False)
         if not sig:
             return False, "", "the network rejected the transaction"
-        if not await sn.confirm_transaction(sig, 40):
+        status, err = await _confirm_tx(sig, 40)
+        if status == "failed":
+            return False, sig, friendly_err(err)
+        if status == "timeout":
             return False, sig, "not confirmed in time — check Solscan before retrying"
         return True, sig, ""
     except Exception as e:
