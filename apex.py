@@ -1071,9 +1071,10 @@ async def pump_pipeline(pool: Pool):
                 return
             buyers = sum(1 for o, _ in holders if o != pool.dev)
             if buyers < MIN_UNIQUE_BUYERS:
-                if last:
-                    _count_reject("few_buyers")
-                continue
+                # Strategy rule: 5 unique buyers within the first 60 seconds, or it's out.
+                # Dropping these here keeps the re-check queue (and credits) for real contenders.
+                _count_reject("few_buyers")
+                return
             if first_pass:
                 first_pass = False
                 _stats["stage1_pass"] += 1
