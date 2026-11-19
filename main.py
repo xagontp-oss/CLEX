@@ -1212,10 +1212,10 @@ async def webhook(req: Request):
     logger.info(f"Webhook: {len(items)} tx · types={sorted({t.get('type', '?') for t in items})}")
     for tx in items:
         t = tx.get("type")
-        if t == "CREATE_POOL":
+        if t in ("CREATE_POOL", "CREATE"):
             asyncio.create_task(apex.on_pool_event(tx))
-        elif t == "CREATE" and LEGACY_PUMP:
-            asyncio.create_task(process_payload([tx]))
+            if t == "CREATE" and LEGACY_PUMP:
+                asyncio.create_task(process_payload([tx]))
     return {"ok": True}
 
 @app.get("/")

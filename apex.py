@@ -54,6 +54,14 @@ MAX_TAX_PCT = 10.0                 # per side
 PROBE_SOL = 0.05                   # size of the honeypot probe quotes
 MAX_EVENT_AGE_SECS = 120           # ignore stale / backfilled webhook events
 
+# pump.fun bonding-curve constants (liquidity is read from the curve's token balance, free)
+PUMP_SUPPLY = 1_000_000_000
+PUMP_K = 1_073_000_000 * 30.0          # virtual token reserve x virtual SOL reserve
+PUMP_VIRT_OFFSET = 279_900_000         # virtual tokens - real tokens on the curve
+PUMP_START_SOL = 30.0                  # virtual SOL at launch
+PUMP_CHECK_AGES = [60, 120, 180, 240, 330, 450, 600]   # seconds after launch
+PUMP_MAX_WATCHERS = 60                 # cap on coins being re-checked at once (credit guard)
+
 # Execution
 ENTRY_SLIPPAGE_BPS = 1500          # 15%
 EXIT_SLIPPAGE_BPS = 2000           # 20%
@@ -411,6 +419,8 @@ class Pool:
     stable_usd: float = 0.0
     lp_mint: str = ""
     lp_minted: float = 0.0
+    kind: str = "raydium"          # "raydium" | "pump"
+    dev_pct0: float = 0.0          # dev's initial buy, % of supply (pump only)
 
 
 _logged_shapes = 0
@@ -450,6 +460,35 @@ def extract_pool(tx: Dict) -> Optional[Pool]:
                 lp_mint=lp, lp_minted=others.get(lp, {}).get("amount", 0.0))
 
 
+def extract_pump(tx: Dict) -> Optional[Pool]:
+    """New pump.fun launch: mint = the account ending in 'pump', dev = fee payer."""
+    dev = tx.get("feePayer", "")
+    mint = ""
+    for a in tx.get("accountData") or []:
+        addr = a.get("account", "")
+        if addr.endswith("pump") and len(addr) in (43, 44):
+            mint = addr
+            break
+    if not mint:
+        for t in tx.get("tokenTransfers") or []:
+            if str(t.get("mint", "")).endswith("pump"):
+                mint = t["mint"]
+                break
+    if not mint:
+        return None
+    dev_tokens = sum(float(t.get("tokenAmount") or 0) for t in tx.get("tokenTransfers") or []
+                     if t.get("mint") == mint and t.get("toUserAccount") == dev)
+    return Pool(mint=mint, dev=dev, ts=float(tx.get("timestamp") or time.time()),
+                sig=tx.get("signature", ""), kind="pump",
+                dev_pct0=dev_tokens / PUMP_SUPPLY * 100.0)
+
+
+def pump_real_sol(curve_tokens_ui: float) -> float:
+    """SOL actually raised on the bonding curve, derived from the curve's token balance."""
+    vt = curve_tokens_ui + PUMP_VIRT_OFFSET
+    return max(0.0, PUMP_K / vt - PUMP_START_SOL) if vt > 0 else 0.0
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # SCREENING
 # ══════════════════════════════════════════════════════════════════════════════
@@ -465,8 +504,9 @@ def _reject(reason: str, permanent: bool = False) -> Verdict:
     return Verdict(False, reason, permanent)
 
 
-async def _holder_view(mint: str, supply_ui: float) -> Optional[List[Tuple[str, float]]]:
-    """[(owner, pct_of_supply)] for real wallets only — pool vaults are excluded."""
+async def _holder_view(mint: str, supply_ui: float):
+    """([(owner, pct_of_supply)] for real wallets only, biggest vault balance).
+    Pool vaults / bonding curves are program-owned (off-curve) and excluded from holders."""
     res = await _h("getTokenLargestAccounts", [mint, {"commitment": "confirmed"}])
     accts = (res or {}).get("value") or []
     if not accts:
@@ -476,16 +516,21 @@ async def _holder_view(mint: str, supply_ui: float) -> Optional[List[Tuple[str, 
                       {"encoding": "jsonParsed", "commitment": "confirmed"}])
     vals = (infos or {}).get("value") or []
     held: Dict[str, float] = {}
+    vault_max = 0.0
     for a, info in zip(accts, vals):
         try:
             owner = info["data"]["parsed"]["info"]["owner"]
         except Exception:
             continue
         ui = float(a.get("uiAmount") or 0)
-        if ui > 0 and is_wallet_address(owner):
+        if ui <= 0:
+            continue
+        if is_wallet_address(owner):
             held[owner] = held.get(owner, 0.0) + ui
-    return sorted(((o, v / supply_ui * 100.0) for o, v in held.items()),
-                  key=lambda x: -x[1])
+        else:
+            vault_max = max(vault_max, ui)
+    return (sorted(((o, v / supply_ui * 100.0) for o, v in held.items()),
+                   key=lambda x: -x[1]), vault_max)
 
 
 async def stage1(pool: Pool) -> Verdict:
@@ -518,9 +563,10 @@ async def stage1(pool: Pool) -> Verdict:
     if not (MIN_SUPPLY <= supply_ui <= MAX_SUPPLY):
         return _reject("supply_range")
 
-    holders = await _holder_view(pool.mint, supply_ui)
-    if holders is None:
+    hv = await _holder_view(pool.mint, supply_ui)
+    if hv is None:
         return _reject("holders_unreadable")
+    holders = hv[0]
     if holders and holders[0][1] > MAX_SINGLE_PCT:
         return _reject("whale_over_15")
     if sum(p for _, p in holders[:10]) > MAX_TOP10_PCT:
@@ -573,9 +619,10 @@ async def _lp_locked(pool: Pool) -> Tuple[bool, str]:
 
 async def stage2(pool: Pool, s1: Dict) -> Verdict:
     """Confirmation after the 60-second organic-discovery window."""
-    holders = await _holder_view(pool.mint, s1["supply_ui"])
-    if holders is None:
+    hv = await _holder_view(pool.mint, s1["supply_ui"])
+    if hv is None:
         return _reject("holders_unreadable")
+    holders = hv[0]
     if holders and holders[0][1] > MAX_SINGLE_PCT:
         return _reject("whale_over_15")
     if sum(p for _, p in holders[:10]) > MAX_TOP10_PCT:
@@ -590,27 +637,48 @@ async def stage2(pool: Pool, s1: Dict) -> Verdict:
     if not ok:
         return _reject(why)
 
-    # honeypot / tax: round-trip through Jupiter quotes (no Helius credits)
-    dec = s1["decimals"]
-    buy = await jup_quote(WSOL, pool.mint, int(PROBE_SOL * 1e9), ENTRY_SLIPPAGE_BPS)
+    return await _jupiter_checks(pool.mint, s1["decimals"], s1["supply_ui"])
+
+
+async def _jupiter_checks(mint: str, dec: int, supply_ui: float) -> Verdict:
+    """Honeypot / tax / market-cap via Jupiter quotes (no Helius credits)."""
+    buy = await jup_quote(WSOL, mint, int(PROBE_SOL * 1e9), ENTRY_SLIPPAGE_BPS)
     if not buy:
         return _reject("no_buy_route")
     got = int(buy["outAmount"])
-    sell = await jup_quote(pool.mint, WSOL, got, EXIT_SLIPPAGE_BPS)
+    sell = await jup_quote(mint, WSOL, got, EXIT_SLIPPAGE_BPS)
     if not sell:
         return _reject("honeypot", permanent=True)
     back = int(sell["outAmount"]) / 1e9
     loss_pct = (1 - back / PROBE_SOL) * 100
     if loss_pct > 2 * MAX_TAX_PCT + 8:      # 2 sides of tax + fees/impact allowance
         return _reject("tax_over_10", permanent=True)
-
     px = await sol_usd()
     price_sol = PROBE_SOL / (got / 10 ** dec)
-    mcap = price_sol * s1["supply_ui"] * px
+    mcap = price_sol * supply_ui * px
     if mcap > MAX_MCAP_USD:
         return _reject("mcap_over_500k")
-    return Verdict(True, data={"mcap": mcap, "price_sol": price_sol,
-                               "loss_pct": loss_pct, "buyers": buyers})
+    return Verdict(True, data={"mcap": mcap, "price_sol": price_sol, "loss_pct": loss_pct})
+
+
+async def pump_final(pool: Pool) -> Verdict:
+    """Last gates for a pump.fun coin that already cleared holders + liquidity."""
+    info = await _h("getAccountInfo", [pool.mint, {"encoding": "jsonParsed"}])
+    try:
+        parsed = info["value"]["data"]["parsed"]["info"]
+        dec = int(parsed["decimals"])
+    except Exception:
+        return _reject("mint_unreadable")
+    if info["value"].get("owner") != TOKEN_PROGRAM:
+        return _reject("token2022", permanent=True)
+    if parsed.get("mintAuthority"):
+        return _reject("mint_authority", permanent=True)
+    if parsed.get("freezeAuthority"):
+        return _reject("freeze_authority", permanent=True)
+    v = await _jupiter_checks(pool.mint, dec, PUMP_SUPPLY)
+    if v.ok:
+        v.data["decimals"] = dec
+    return v
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -934,10 +1002,96 @@ def _count_reject(reason: str):
     _reject_reasons[reason] = _reject_reasons.get(reason, 0) + 1
 
 
+_pump_watchers = 0
+
+
+async def _finish_entry(pool: Pool, dec: int, mcap: float):
+    meta = await _das("getAsset", {"id": pool.mint}) or {}
+    md = (meta.get("content") or {}).get("metadata") or {}
+    name = md.get("name") or pool.mint[:6]
+    symbol = md.get("symbol") or "?"
+    for u in await _active_users():
+        asyncio.create_task(_enter_one(u, pool.mint, name, symbol, dec, mcap))
+    logger.info(f"APEX PASS [{pool.kind}] {name} ({pool.mint[:8]}) mcap=${mcap:,.0f}")
+
+
+async def pump_pipeline(pool: Pool):
+    """
+    pump.fun launches. Same gates as the Raydium path, adapted to a bonding curve:
+      free  : dev's initial buy <= 5% (read straight from the webhook payload)
+      T+60s : holders (2 calls) -> top10/whale/dev gates, 5+ unique buyers
+              curve liquidity is derived from the curve's token balance (free)
+      later : re-check at a few widening intervals until liquidity >= $3,000
+    A bonding curve cannot be pulled by the dev, which is the curve-stage equivalent
+    of 'LP burned or locked'.
+    """
+    global _pump_watchers
+    if pool.dev_pct0 > MAX_DEV_PCT:
+        _count_reject("dev_over_5")
+        return
+    if _pump_watchers >= PUMP_MAX_WATCHERS:
+        _count_reject("capacity")
+        return
+    _pump_watchers += 1
+    first_pass = True
+    try:
+        for i, age in enumerate(PUMP_CHECK_AGES):
+            wait = pool.ts + age - time.time()
+            if wait > 0:
+                await asyncio.sleep(wait)
+            if not await _budget_ok():
+                return
+            last = i == len(PUMP_CHECK_AGES) - 1
+            async with _pipeline_sem:
+                hv = await _holder_view(pool.mint, PUMP_SUPPLY)
+            if hv is None:
+                if last:
+                    _count_reject("holders_unreadable")
+                continue
+            holders, curve_ui = hv
+            if holders and holders[0][1] > MAX_SINGLE_PCT:
+                _count_reject("whale_over_15")
+                return
+            if sum(p for _, p in holders[:10]) > MAX_TOP10_PCT:
+                _count_reject("top10_over_40")
+                return
+            if next((p for o, p in holders if o == pool.dev), 0.0) > MAX_DEV_PCT:
+                _count_reject("dev_over_5")
+                return
+            buyers = sum(1 for o, _ in holders if o != pool.dev)
+            if buyers < MIN_UNIQUE_BUYERS:
+                if last:
+                    _count_reject("few_buyers")
+                continue
+            if first_pass:
+                first_pass = False
+                _stats["stage1_pass"] += 1
+            px = await sol_usd()
+            if pump_real_sol(curve_ui) * px < MIN_POOL_USD:
+                if last:
+                    _count_reject("liquidity_low")
+                continue
+            async with _pipeline_sem:
+                v = await pump_final(pool)
+            if not v.ok:
+                _count_reject(v.reason)
+                if v.permanent:
+                    await blacklist_add(pool.mint, v.reason)
+                return
+            _stats["confirmed"] += 1
+            await _finish_entry(pool, v.data["decimals"], v.data["mcap"])
+            return
+    finally:
+        _pump_watchers -= 1
+
+
 async def on_pool_event(tx: Dict):
     _stats["events"] += 1
     try:
-        pool = extract_pool(tx)
+        is_pump = tx.get("type") == "CREATE"
+        if is_pump and tx.get("source") != "PUMP_FUN":
+            return
+        pool = extract_pump(tx) if is_pump else extract_pool(tx)
         if not pool:
             _stats["unparsed"] += 1
             return
@@ -950,6 +1104,12 @@ async def on_pool_event(tx: Dict):
             _stats["idle_skips"] += 1     # nobody is trading: spend zero credits
             return
         if not await _budget_ok():
+            return
+        if pool.mint in _blacklist:
+            return
+        if is_pump:
+            _stats["pump_launches"] = _stats.get("pump_launches", 0) + 1
+            await pump_pipeline(pool)
             return
         async with _pipeline_sem:
             v1 = await stage1(pool)
@@ -970,14 +1130,7 @@ async def on_pool_event(tx: Dict):
                 await blacklist_add(pool.mint, v2.reason)
             return
         _stats["confirmed"] += 1
-        meta = await _das("getAsset", {"id": pool.mint}) or {}
-        md = (meta.get("content") or {}).get("metadata") or {}
-        name = md.get("name") or pool.mint[:6]
-        symbol = md.get("symbol") or "?"
-        for u in await _active_users():
-            asyncio.create_task(_enter_one(u, pool.mint, name, symbol,
-                                           v1.data["decimals"], v2.data["mcap"]))
-        logger.info(f"APEX PASS {name} ({pool.mint[:8]}) mcap=${v2.data['mcap']:,.0f}")
+        await _finish_entry(pool, v1.data["decimals"], v2.data["mcap"])
     except Exception as e:
         logger.error(f"on_pool_event: {e}", exc_info=True)
 
@@ -1376,7 +1529,7 @@ async def _status_page() -> Tuple[str, InlineKeyboardMarkup]:
             f"Feed       {'🟢 live' if silent < 300 else '🟠 quiet'} · last event {silent}s ago\n"
             f"SOL        ${px:,.2f}\n\n"
             f"<b>Since last restart</b>\n"
-            f"Pools seen        <code>{_stats['events']}</code>\n"
+            f"Launches seen     <code>{_stats['events']}</code>\n"
             f"Passed stage 1    <code>{_stats['stage1_pass']}</code>\n"
             f"Fully confirmed   <code>{_stats['confirmed']}</code>\n"
             f"Entries           <code>{_stats['entries']}</code>\n\n"
@@ -1424,12 +1577,13 @@ async def _bl_text() -> str:
 async def cb_how(q: CallbackQuery):
     await _send(q, (
         f"<b>📖 How Apex Works</b>\n{RULE}\n"
-        "<b>1 · Detect</b> — every new Raydium pool, in seconds.\n\n"
+        "<b>1 · Detect</b> — every new pump.fun launch and Raydium pool, in seconds. "
+        "Most launches are dropped for free before a single paid call.\n\n"
         "<b>2 · Gauntlet</b> — a launch must clear <i>all</i> of these:\n"
         "  • Mint &amp; freeze authority renounced\n"
         "  • Supply 100M – 1T, standard SPL token\n"
         "  • Top 10 wallets ≤ 40%, none above 15%, dev ≤ 5%\n"
-        "  • Pool ≥ $3,000 and LP burned or locked\n"
+        "  • Liquidity ≥ $3,000 (a bonding curve can't be pulled; Raydium LP must be burned or locked)\n"
         "  • Minted within 30 min of the pool\n"
         "  • 5+ unique buyers in the first 60 seconds\n"
         "  • Buy &amp; sell both route, tax ≤ 10%, market cap &lt; $500K\n\n"
