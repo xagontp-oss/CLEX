@@ -958,6 +958,15 @@ async def housekeeping_loop():
         await asyncio.sleep(30)
         try:
             await _flush_credits()
+            global _last_summary
+            if time.time() - _last_summary > 300:
+                _last_summary = time.time()
+                today, month = await credits_used()
+                top = sorted(_reject_reasons.items(), key=lambda x: -x[1])[:3]
+                logger.info(f"APEX summary: launches={_stats['events']} stage1={_stats['stage1_pass']} "
+                            f"confirmed={_stats['confirmed']} entries={_stats['entries']} "
+                            f"idle_skips={_stats['idle_skips']} top_rejects={top} "
+                            f"credits today={today:,} month={month:,}")
             for m in [m for m, t in _seen.items() if time.time() - t > 6 * 3600]:
                 _seen.pop(m, None)
             hr = datetime.now(timezone.utc).hour
@@ -1003,6 +1012,7 @@ def _count_reject(reason: str):
 
 
 _pump_watchers = 0
+_last_summary = 0.0
 
 
 async def _finish_entry(pool: Pool, dec: int, mcap: float):

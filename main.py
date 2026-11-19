@@ -1209,7 +1209,7 @@ async def webhook(req: Request):
     payload = await req.json()
     apex.note_webhook()
     items = payload if isinstance(payload, list) else []
-    logger.info(f"Webhook: {len(items)} tx · types={sorted({t.get('type', '?') for t in items})}")
+    logger.debug(f"Webhook: {len(items)} tx · types={sorted({t.get('type', '?') for t in items})}")
     for tx in items:
         t = tx.get("type")
         if t in ("CREATE_POOL", "CREATE"):
