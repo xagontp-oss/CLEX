@@ -1204,10 +1204,12 @@ async def webhook(req: Request):
     if got.startswith("Bearer "):
         got = got[7:]
     if not WEBHOOK_SECRET or not hmac.compare_digest(got, WEBHOOK_SECRET):
+        logger.warning("Webhook rejected: bad or missing Authorization header")
         raise HTTPException(status_code=401, detail="unauthorized")
     payload = await req.json()
     apex.note_webhook()
     items = payload if isinstance(payload, list) else []
+    logger.info(f"Webhook: {len(items)} tx · types={sorted({t.get('type', '?') for t in items})}")
     for tx in items:
         t = tx.get("type")
         if t == "CREATE_POOL":
