@@ -44,6 +44,7 @@ from sniper import (
 )
 import sniper as sn
 import apex
+import access
 
 # ── ENV ───────────────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -79,6 +80,8 @@ logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 bot    = Bot(token=TELEGRAM_TOKEN)
 dp     = Dispatcher()
 router = Router()
+access.install(dp)               # every message/button passes the invite-only gate first
+dp.include_router(access.router)  # owner's admin panel
 dp.include_router(apex.router)   # Apex pages take priority
 dp.include_router(router)
 
@@ -1165,6 +1168,7 @@ async def lifespan(app: FastAPI):
     await init_sniper_db()
     set_alert_callback(sniper_message_callback)
     await apex.startup(bot)
+    await access.startup(bot)
     await bot.delete_webhook(drop_pending_updates=True)
 
     # Register the Telegram command menu (the “/” autocomplete list).

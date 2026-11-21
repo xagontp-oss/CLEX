@@ -447,11 +447,21 @@ async def set_setting(uid: int, **kv):
         await db.commit()
 
 
+_access = {"deny": lambda uid: False, "admin": 0}
+
+
+def set_access_hooks(is_blocked, admin_id: int):
+    """Wired by access.py. `is_blocked(uid)` -> True means: no NEW trades for that user
+    (their open positions are still managed). `admin_id` shows the owner's Admin button."""
+    _access["deny"] = is_blocked
+    _access["admin"] = admin_id
+
+
 async def _active_users() -> List[Dict]:
     async with aiosqlite.connect(DB_PATH, timeout=10) as db:
         db.row_factory = aiosqlite.Row
         cur = await db.execute("SELECT * FROM apex_settings WHERE paused=0")
-        return [dict(r) for r in await cur.fetchall()]
+        return [dict(r) for r in await cur.fetchall() if not _access["deny"](r["user_id"])]
 
 
 async def positions(uid: Optional[int] = None, status: str = "open",
@@ -1693,7 +1703,7 @@ async def _home(uid: int, banner: str = "") -> Tuple[str, InlineKeyboardMarkup]:
         [("🧭 Strategy", "ax:strat"), ("💵 Size", "ax:size")],
         [("👛 Wallet", "ax:wallet"), ("📡 Status", "ax:stat")],
         [("🚫 Blacklist", "ax:bl"), ("📖 How it works", "ax:how")],
-    ])
+    ] + ([[("🛡 Admin", "adm:home")]] if _access["admin"] and uid == _access["admin"] else []))
     return text, kb
 
 
