@@ -74,6 +74,22 @@ FLOW_CHECKS = 2                        # evaluated at the first two check times 
 FLOW_SCORE_START, FLOW_SCORE_FLOOR, FLOW_SCORE_CAP = 0.50, 0.30, 0.80
 FLOW_TUNE_WARMUP, FLOW_TUNE_EVERY, FLOW_TUNE_STEP = 600, 300, 0.05
 
+# Apex SCALP (loosest gates, fast in-and-out, ~50 signals an hour)
+SCALP_TARGET_PER_HOUR = 50
+SCALP_MAX_DEV = 15.0
+SCALP_MAX_SINGLE = 25.0
+SCALP_TOP10 = 60.0
+SCALP_MAX_CLUSTER = 6
+SCALP_MIN_BUYERS = 2
+SCALP_MIN_SOL = 0.5
+SCALP_MOVE_SPEED = 0.8                 # SOL raised per minute that counts as "movement"
+SCALP_MOVE_DELTA = 0.4                 # ...or SOL added since the previous look
+SCALP_CHECKS = 2
+SCALP_SCORE_START, SCALP_SCORE_FLOOR, SCALP_SCORE_CAP = 0.30, 0.10, 0.70
+SCALP_FAST_INTERVAL = 6                # seconds between price checks on scalp positions
+SCALP_BREAKER_TRADES = 20              # circuit breaker: look at the last 20 scalp closes...
+SCALP_BREAKER_LOSS = 3.0               # ...stop the sniper if they lost more than 3 trade-sizes
+
 # Execution
 ENTRY_SLIPPAGE_BPS = 1500          # 15%
 EXIT_SLIPPAGE_BPS = 2000           # 20%
@@ -122,6 +138,15 @@ PROFILES: Dict[str, Dict] = {
           "blurb": "In, +50%, out. Compound the small wins.",
           "rows": ["+50% → sell 100%"]},
 }
+# The scalp exit is automatic for Apex Scalp (not shown in the exit menu).
+PROFILES["S"] = {"name": "Scalp", "icon": "🗡", "trail": True, "hidden": True,
+                 "tiers": [(1.15, 0.5), (1.35, 1.0)],
+                 "stop": 0.85, "trail_activate": 1.10, "trail_keep": 0.90,
+                 "time_stop_secs": 180, "time_stop_ratio": 1.05,
+                 "blurb": "Quick in-and-out.",
+                 "rows": ["+15% → sell half", "+35% → sell the rest",
+                          "−10% from the peak (once +10% up) → out", "−15% hard stop",
+                          "Flat for 3 minutes → out"]}
 SIZE_OPTIONS_USD = [5, 10, 25, 50, 100]
 
 # LP verification
@@ -718,18 +743,23 @@ def decide_exit(profile: str, ratio: float, tiers_hit: int, peak: float,
              "clock_start": y}. kind is "partial" or "all".
     """
     prof = PROFILES[profile]
+    stop = prof.get("stop", HARD_STOP_RATIO)
+    trail_on = prof.get("trail_activate", TRAIL_ACTIVATE_RATIO)
+    trail_keep = prof.get("trail_keep", TRAIL_KEEP)
+    ts_secs = prof.get("time_stop_secs", TIME_STOP_SECS)
+    ts_ratio = prof.get("time_stop_ratio", TIME_STOP_RATIO)
     peak = max(peak, ratio)
-    if ratio > TIME_STOP_RATIO:
+    if ratio > ts_ratio:
         clock_start = now
     out = {"actions": [], "peak": peak, "clock_start": clock_start}
 
-    if prof["trail"] and peak >= TRAIL_ACTIVATE_RATIO and ratio <= peak * TRAIL_KEEP:
+    if prof["trail"] and peak >= trail_on and ratio <= peak * trail_keep:
         out["actions"].append(("all", 1.0, "trailing_stop", -1))
         return out
-    if ratio <= HARD_STOP_RATIO:
+    if ratio <= stop:
         out["actions"].append(("all", 1.0, "stop_loss", -1))
         return out
-    if now - clock_start >= TIME_STOP_SECS and ratio <= TIME_STOP_RATIO:
+    if now - clock_start >= ts_secs and ratio <= ts_ratio:
         out["actions"].append(("all", 1.0, "time_stop", -1))
         return out
     for i, (thr, frac) in enumerate(prof["tiers"]):
@@ -739,7 +769,7 @@ def decide_exit(profile: str, ratio: float, tiers_hit: int, peak: float,
         if frac >= 1.0:
             out["actions"].append(("all", 1.0, "target", i))
         else:
-            out["actions"].append(("partial", frac, f"target_{int(thr)}x", i))
+            out["actions"].append(("partial", frac, f"target_{int(round((thr - 1) * 100))}pct" if thr < 2 else f"target_{int(thr)}x", i))
         if last and frac >= 1.0:
             break
     return out
@@ -897,6 +927,7 @@ async def _enter_one(u: Dict, mint: str, name: str, symbol: str, dec: int, mcap:
         if sol * px < MIN_TRADE_USD - 0.01:
             return
         mode = "live"
+        profile = "S" if u.get("entry") == "scalp" else u["profile"]
         w = await _wallet(uid)
         if not w:
             return
@@ -931,10 +962,10 @@ async def _enter_one(u: Dict, mint: str, name: str, symbol: str, dec: int, mcap:
                 "entry_tokens,entry_price,entry_mcap,decimals,tokens_left,profile,peak_ratio,"
                 "clock_start,buy_tx) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (uid, mode, mint, name, symbol, now, sol, tokens, entry_price, mcap, dec,
-                 tokens, u["profile"], 1.0, now, sig))
+                 tokens, profile, 1.0, now, sig))
             await db.commit()
         _stats["entries"] += 1
-        prof = PROFILES[u["profile"]]
+        prof = PROFILES[profile]
         tag = "🔴 LIVE"
         await _notify(uid, (
             f"🎯 <b>Position opened</b>  ·  {tag}\n"
@@ -945,7 +976,8 @@ async def _enter_one(u: Dict, mint: str, name: str, symbol: str, dec: int, mcap:
             f"Size       <code>{sol:.4f} SOL</code> (≈ ${sol * px:,.2f})\n"
             f"Mkt cap    <code>${mcap:,.0f}</code>\n"
             f"Exit plan  {prof['icon']} {prof['name']}\n"
-            f"Stop       <code>-45%</code> hard · trailing after +100%\n\n"
+            f"Stop       <code>-{(1 - prof.get('stop', HARD_STOP_RATIO)) * 100:.0f}%</code> hard · "
+            f"trailing after +{(prof.get('trail_activate', TRAIL_ACTIVATE_RATIO) - 1) * 100:.0f}%\n\n"
             f"<a href=\"https://dexscreener.com/solana/{mint}\">Chart</a> · "
             f"<a href=\"https://solscan.io/token/{mint}\">Solscan</a>"))
     except Exception as e:
@@ -983,6 +1015,8 @@ async def _close_or_reduce(pos: Dict, tokens: float, reason: str, tier: int,
             f"Returned  <code>{realized:.4f} SOL</code>\n"
             f"Net       <code>{sign}{pnl:.4f} SOL</code> (≈ {sign}${pnl * px:,.2f})\n"
             f"Reason    <code>{reason}</code>"))
+        if pos["profile"] == "S":
+            await _scalp_breaker(uid)
     else:
         await _update_pos(pos["id"], tokens_left=left, realized_sol=realized, tiers_hit=hit)
         pct = tokens / pos["tokens_left"] * 100 if pos["tokens_left"] else 0
@@ -993,6 +1027,22 @@ async def _close_or_reduce(pos: Dict, tokens: float, reason: str, tier: int,
             f"Still held <code>{left / pos['entry_tokens'] * 100:.0f}%</code> of the original\n"
             f"Tier       <code>{reason}</code>"))
     return True
+
+
+async def _scalp_breaker(uid: int):
+    """Stop the sniper if the last 20 scalp trades lost more than 3 trade-sizes in total."""
+    rows = [p for p in await positions(uid, "closed", 60) if p["profile"] == "S"][:SCALP_BREAKER_TRADES]
+    if len(rows) < SCALP_BREAKER_TRADES:
+        return
+    net = sum(p["realized_sol"] - p["entry_sol"] for p in rows)
+    size = sum(p["entry_sol"] for p in rows) / len(rows)
+    if net <= -SCALP_BREAKER_LOSS * size:
+        await set_setting(uid, paused=1)
+        await _notify(uid, "🛑 <b>Circuit breaker — sniper stopped</b>\n" + RULE +
+                      f"\nThe last {SCALP_BREAKER_TRADES} scalp trades lost <b>{-net:.4f} SOL</b> "
+                      f"(more than {SCALP_BREAKER_LOSS:g} trade-sizes). Apex stopped itself so a bad "
+                      "stretch can't keep draining the wallet. Open positions are still protected.\n\n"
+                      "Restart whenever you're ready, or switch strategy.")
 
 
 async def _manage(pos: Dict):
@@ -1007,7 +1057,7 @@ async def _manage(pos: Dict):
                             EXIT_SLIPPAGE_BPS)
         if not q:
             fails = pos["fails"] + 1
-            if fails >= DEAD_AFTER_FAILS:
+            if fails >= (50 if pos["profile"] == "S" else DEAD_AFTER_FAILS):
                 await _update_pos(pos["id"], status="closed", exit_ts=time.time(),
                                   exit_reason="illiquid_writeoff", tokens_left=0, fails=fails)
                 await blacklist_add(pos["mint"], "illiquid")
@@ -1041,16 +1091,24 @@ async def _manage(pos: Dict):
                 break
 
 
+_last_manage: Dict[int, float] = {}
+
+
 async def monitor_loop():
     logger.info("Apex position monitor started")
     while True:
         try:
             ps = await positions(None, "open", 500)
-            if ps:
-                await asyncio.gather(*[_manage(p) for p in ps], return_exceptions=True)
+            now = time.time()
+            due = [p for p in ps if p["profile"] == "S"
+                   or now - _last_manage.get(p["id"], 0) >= MONITOR_INTERVAL]
+            for p in due:
+                _last_manage[p["id"]] = now
+            if due:
+                await asyncio.gather(*[_manage(p) for p in due], return_exceptions=True)
         except Exception as e:
             logger.error(f"monitor: {e}", exc_info=True)
-        await asyncio.sleep(MONITOR_INTERVAL)
+        await asyncio.sleep(SCALP_FAST_INTERVAL)
 
 
 async def housekeeping_loop():
@@ -1059,14 +1117,18 @@ async def housekeeping_loop():
         await asyncio.sleep(30)
         try:
             await _flush_credits()
-            flow_tune(time.time(), any(u.get("entry") == "flow" for u in await _active_users()))
+            _act = await _active_users()
+            flow_tune(time.time(), any(u.get("entry") == "flow" for u in _act))
+            scalp_tune(time.time(), any(u.get("entry") == "scalp" for u in _act))
             global _last_summary
             if time.time() - _last_summary > 300:
                 _last_summary = time.time()
                 today, month = await credits_used()
                 top = sorted(_reject_reasons.items(), key=lambda x: -x[1])[:3]
                 logger.info(f"APEX flow: threshold={_flow['min_score']:.2f} "
-                            f"signals_last_hour={len([t for t in _flow['signals'] if time.time() - t < 3600])}")
+                            f"signals_last_hour={len([t for t in _flow['signals'] if time.time() - t < 3600])}"
+                            f" | scalp: threshold={_scalp['min_score']:.2f} "
+                            f"signals_last_hour={len([t for t in _scalp['signals'] if time.time() - t < 3600])}")
                 logger.info(f"APEX summary: launches={_stats['events']} stage1={_stats['stage1_pass']} "
                             f"confirmed={_stats['confirmed']} entries={_stats['entries']} "
                             f"idle_skips={_stats['idle_skips']} top_rejects={top} "
@@ -1210,25 +1272,74 @@ def flow_evaluate(pool: Pool, holders, amounts, real_sol: float, age_s: float,
     return True, "", sc
 
 
-def flow_tune(now: float, flow_users_active: bool):
-    """Steer the score threshold toward ~20 signals an hour: loosen when short, tighten when flooded."""
-    if not flow_users_active:
-        _flow["active_since"] = 0.0
+def _tune(state: Dict, target: int, floor: float, cap: float, now: float, active: bool):
+    """Steer a score threshold toward `target` signals an hour: loosen when short, tighten when flooded.
+    Warm-up first, then at most one step every 5 minutes."""
+    if not active:
+        state["active_since"] = 0.0
         return
-    if not _flow["active_since"]:
-        _flow["active_since"] = now
+    if not state["active_since"]:
+        state["active_since"] = now
         return
-    _flow["signals"] = [t for t in _flow["signals"] if now - t < 3600]
-    ran = min(3600.0, now - _flow["active_since"])
-    if ran < FLOW_TUNE_WARMUP or now - _flow["last_tune"] < FLOW_TUNE_EVERY:
-        return                                       # warm up first, then adjust at most every 5 minutes
-    _flow["last_tune"] = now
-    expected = FLOW_TARGET_PER_HOUR * ran / 3600
-    n = len(_flow["signals"])
+    state["signals"] = [t for t in state["signals"] if now - t < 3600]
+    ran = min(3600.0, now - state["active_since"])
+    if ran < FLOW_TUNE_WARMUP or now - state["last_tune"] < FLOW_TUNE_EVERY:
+        return
+    state["last_tune"] = now
+    expected = target * ran / 3600
+    n = len(state["signals"])
     if n < expected * 0.9:
-        _flow["min_score"] = max(FLOW_SCORE_FLOOR, round(_flow["min_score"] - FLOW_TUNE_STEP, 3))
+        state["min_score"] = max(floor, round(state["min_score"] - FLOW_TUNE_STEP, 3))
     elif n > expected * 1.8:
-        _flow["min_score"] = min(FLOW_SCORE_CAP, round(_flow["min_score"] + FLOW_TUNE_STEP, 3))
+        state["min_score"] = min(cap, round(state["min_score"] + FLOW_TUNE_STEP, 3))
+
+
+def flow_tune(now: float, active: bool):
+    _tune(_flow, FLOW_TARGET_PER_HOUR, FLOW_SCORE_FLOOR, FLOW_SCORE_CAP, now, active)
+
+
+_scalp = {"min_score": SCALP_SCORE_START, "signals": [], "active_since": 0.0, "last_tune": 0.0}
+
+
+def scalp_tune(now: float, active: bool):
+    _tune(_scalp, SCALP_TARGET_PER_HOUR, SCALP_SCORE_FLOOR, SCALP_SCORE_CAP, now, active)
+
+
+def scalp_evaluate(pool: Pool, holders, amounts, real_sol: float, age_s: float,
+                   dex: Optional[Dict], prev_sol: Optional[float]) -> Tuple[bool, str, float]:
+    """Loosest gates + a 'is it moving right now' test. Reasons other than the retryable ones are final."""
+    if pool.dev_pct0 > SCALP_MAX_DEV:
+        return False, "dev_over_15", 0.0
+    if holders and holders[0][1] > SCALP_MAX_SINGLE:
+        return False, "whale_over_25", 0.0
+    top10 = sum(p for _, p in holders[:10])
+    if top10 > SCALP_TOP10:
+        return False, "top10_over_60", 0.0
+    if pool.dev_pct0 >= 1.0 and not any(o == pool.dev for o, _ in holders):
+        return False, "dev_sold", 0.0                      # the dumper has already left
+    if cluster_size(amounts) >= SCALP_MAX_CLUSTER:
+        return False, "bundled", 0.0
+    if dex and dex["sells5"] > dex["buys5"] * 1.5 and dex["sells5"] >= 6:
+        return False, "dumping", 0.0                       # sells already outrunning buys
+    if dex and dex["chg5"] > 600:
+        return False, "parabolic", 0.0                     # we'd be buying the top
+    buyers = sum(1 for o, _ in holders if o != pool.dev)
+    if buyers < SCALP_MIN_BUYERS:
+        return False, "few_buyers", 0.0
+    if real_sol < SCALP_MIN_SOL:
+        return False, "curve_idle", 0.0
+    # movement: money is arriving on the curve right now
+    speed = real_sol / max(age_s / 60, 0.5)
+    moving = speed >= SCALP_MOVE_SPEED or (prev_sol is not None and real_sol - prev_sol >= SCALP_MOVE_DELTA)
+    if dex:
+        n = dex["buys5"] + dex["sells5"]
+        moving = moving and n >= 5 and dex["buys5"] / n >= 0.5
+    if not moving:
+        return False, "no_movement", 0.0
+    sc = flow_score(buyers, min(top10, FLOW_TOP10), real_sol, age_s, dex)
+    if sc < _scalp["min_score"]:
+        return False, "score_low", sc
+    return True, "", sc
 
 
 async def _finish_entry(pool: Pool, dec: int, mcap: float, entry: str = "apex"):
@@ -1238,6 +1349,8 @@ async def _finish_entry(pool: Pool, dec: int, mcap: float, entry: str = "apex"):
     symbol = md.get("symbol") or "?"
     if entry == "flow":
         _flow["signals"].append(time.time())
+    elif entry == "scalp":
+        _scalp["signals"].append(time.time())
     for u in await _active_users():
         if u.get("entry", "apex") == entry:
             asyncio.create_task(_enter_one(u, pool.mint, name, symbol, dec, mcap))
@@ -1246,26 +1359,31 @@ async def _finish_entry(pool: Pool, dec: int, mcap: float, entry: str = "apex"):
 
 async def pump_pipeline(pool: Pool):
     """
-    pump.fun launches, for whichever entry strategies have a running user:
+    pump.fun launches, for whichever entry strategies have a running user. One holder lookup per
+    check is shared by all of them, so running several costs no more credits.
 
     PRECISION  free dev<=5% -> T+60 holders (5+ unique buyers, whale/top10/dev gates)
                -> wait for curve liquidity >= $3,000 (re-checks out to 10 min) -> final safety.
     FLOW       free dev<=8% -> T+60 / T+120 holders + DexScreener momentum, bundle and dev-sold
-               detection, scored; the score threshold self-tunes toward ~20 signals an hour.
-    Both share one holder lookup per check, so running both costs no more credits.
+               detection, scored; the threshold self-tunes toward ~20 signals an hour.
+    SCALP      free dev<=15% -> loosest gates + a live 'is it moving' test at T+60 / T+120,
+               dump / parabolic filters; the threshold self-tunes toward ~50 signals an hour.
     """
     global _pump_watchers
     users = await _active_users()
-    want_apex = any(u.get("entry", "apex") == "apex" for u in users) and pool.dev_pct0 <= MAX_DEV_PCT
-    want_flow = any(u.get("entry") == "flow" for u in users) and pool.dev_pct0 <= FLOW_MAX_DEV
-    if not (want_apex or want_flow):
-        _count_reject("dev_over_8" if any(u.get("entry") == "flow" for u in users) else "dev_over_5")
+    ent = {u.get("entry", "apex") for u in users}
+    want_apex = "apex" in ent and pool.dev_pct0 <= MAX_DEV_PCT
+    want_flow = "flow" in ent and pool.dev_pct0 <= FLOW_MAX_DEV
+    want_scalp = "scalp" in ent and pool.dev_pct0 <= SCALP_MAX_DEV
+    if not (want_apex or want_flow or want_scalp):
+        _count_reject("dev_over_" + ("15" if "scalp" in ent else "8" if "flow" in ent else "5"))
         return
     if _pump_watchers >= PUMP_MAX_WATCHERS:
         _count_reject("capacity")
         return
     _pump_watchers += 1
     first_pass = True
+    prev_sol: Optional[float] = None
     final: Optional[Verdict] = None
     try:
         for i, age in enumerate(PUMP_CHECK_AGES):
@@ -1273,9 +1391,11 @@ async def pump_pipeline(pool: Pool):
             if wait > 0:
                 await asyncio.sleep(wait)
             users = await _active_users()
-            want_apex = want_apex and any(u.get("entry", "apex") == "apex" for u in users)
-            want_flow = want_flow and i < FLOW_CHECKS and any(u.get("entry") == "flow" for u in users)
-            if not (want_apex or want_flow) or not await _budget_ok():
+            ent = {u.get("entry", "apex") for u in users}
+            want_apex = want_apex and "apex" in ent
+            want_flow = want_flow and i < FLOW_CHECKS and "flow" in ent
+            want_scalp = want_scalp and i < SCALP_CHECKS and "scalp" in ent
+            if not (want_apex or want_flow or want_scalp) or not await _budget_ok():
                 return
             last = i == len(PUMP_CHECK_AGES) - 1
             async with _pipeline_sem:
@@ -1287,12 +1407,33 @@ async def pump_pipeline(pool: Pool):
             holders, curve_ui, amounts = hv
             px = await sol_usd()
             real_sol = pump_real_sol(curve_ui)
+            age_s = max(1.0, time.time() - pool.ts)
+            dex = await dex_metrics(pool.mint) if (want_flow or want_scalp) else None
+
+            # ---------------- SCALP
+            if want_scalp:
+                ok, why, sc = scalp_evaluate(pool, holders, amounts, real_sol, age_s, dex, prev_sol)
+                retry = why in ("score_low", "few_buyers", "curve_idle", "no_movement")
+                if ok:
+                    want_scalp = False
+                    if final is None:
+                        async with _pipeline_sem:
+                            final = await pump_final(pool)
+                    if final.ok:
+                        _stats["scalp_signals"] = _stats.get("scalp_signals", 0) + 1
+                        await _finish_entry(pool, final.data["decimals"], final.data["mcap"], "scalp")
+                    else:
+                        _count_reject("scalp_" + final.reason)
+                        if final.permanent:
+                            await blacklist_add(pool.mint, final.reason)
+                            return
+                elif not retry or i == SCALP_CHECKS - 1:
+                    want_scalp = False
+                    _count_reject("scalp_" + why)
 
             # ---------------- FLOW
             if want_flow:
-                dex = await dex_metrics(pool.mint)
-                ok, why, sc = flow_evaluate(pool, holders, amounts, real_sol,
-                                            max(1.0, time.time() - pool.ts), dex)
+                ok, why, sc = flow_evaluate(pool, holders, amounts, real_sol, age_s, dex)
                 if ok:
                     want_flow = False
                     if final is None:
@@ -1350,7 +1491,8 @@ async def pump_pipeline(pool: Pool):
                         _count_reject("liquidity_low")
                         want_apex = False
 
-            if not (want_apex or want_flow):
+            prev_sol = real_sol
+            if not (want_apex or want_flow or want_scalp):
                 return
     finally:
         _pump_watchers -= 1
@@ -1478,7 +1620,7 @@ async def _home(uid: int, banner: str = "") -> Tuple[str, InlineKeyboardMarkup]:
         f"<b>◆ CLEX APEX</b>\n<i>Precision entries on fresh Solana launches.</i>\n{RULE}\n"
         f"<code>Sniper   </code><b>{state}</b>\n"
         f"<code>Entry    </code>{ENTRIES[s.get('entry', 'apex')]['icon']} {ENTRIES[s.get('entry', 'apex')]['name']}\n"
-        f"<code>Exit     </code>{prof['icon']} {prof['name']}\n"
+        f"<code>Exit     </code>{'🗡 Scalp (automatic)' if s.get('entry') == 'scalp' else prof['icon'] + ' ' + prof['name']}\n"
         f"<code>Size     </code>{size}"
         + (f" ≈ {s['size_sol'] * px:.2f} USD" if s["size_sol"] and px else "") + "\n"
         f"<code>Wallet   </code>{wal}\n"
@@ -1513,6 +1655,10 @@ ENTRIES = {
     "flow": {"icon": "🌊", "name": "Apex Flow",
              "blurb": "Looser, faster. Aims for ~20 entries an hour and picks the strongest "
                       "momentum, filtering out bundled launches, dumping devs and whales."},
+    "scalp": {"icon": "🗡", "name": "Apex Scalp",
+              "blurb": "Loosest gates, one test: is it moving right now? Aims for ~50 quick "
+                       "in-and-out trades an hour with its own tight exit (own stop, trailing "
+                       "stop, 3-minute time-out). A circuit breaker stops it after a bad streak."},
 }
 
 
@@ -1524,14 +1670,18 @@ async def _strategy_page(uid: int = 0) -> Tuple[str, InlineKeyboardMarkup]:
     lines = [f"<b>🧭 Strategy</b>\n{RULE}\n<b>1 · Entry — what to buy</b>"]
     for k, e in ENTRIES.items():
         lines.append(f"\n{'✅' if k == cur else '▫️'} <b>{e['icon']} {e['name']}</b>\n<i>{e['blurb']}</i>")
-    lines.append(f"\n{RULE}\n<b>2 · Exit — how to take profit</b> <i>(applies to every new trade)</i>")
+    lines.append(f"\n{RULE}\n<b>2 · Exit — how to take profit</b> <i>(applies to every new trade; "
+                 "🗡 Scalp always uses its own exit)</i>")
     for k, p in PROFILES.items():
+        if p.get("hidden"):
+            continue
         lines.append(f"\n<b>{k} · {p['icon']} {p['name']}</b>\n<i>{p['blurb']}</i>\n" +
                      "\n".join(f"  • {r}" for r in p["rows"]))
     lines.append("\n\n<b>Always on:</b> −45% hard stop · 72h time-stop if flat.")
     kb = _kb([[(("✅ " if k == cur else "") + f"{e['icon']} {e['name']}", f"ax:ent:{k}")]
               for k, e in ENTRIES.items()] +
-             [[(f"{k} · {p['name']}", f"ax:prof:{k}")] for k, p in PROFILES.items()] +
+             [[(f"{k} · {p['name']}", f"ax:prof:{k}")] for k, p in PROFILES.items()
+              if not p.get("hidden")] +
              [HOME_BTN])
     return "\n".join(lines), kb
 
@@ -1721,7 +1871,7 @@ async def _positions_page(uid: int) -> Tuple[str, InlineKeyboardMarkup]:
         if PROFILES[p["profile"]]["trail"] and p["peak_ratio"] >= TRAIL_ACTIVATE_RATIO:
             floor = f"trail {(p['peak_ratio'] * TRAIL_KEEP - 1) * 100:+.0f}%"
         else:
-            floor = "stop −45%"
+            floor = f"stop −{(1 - PROFILES[p['profile']].get('stop', HARD_STOP_RATIO)) * 100:.0f}%"
         tag = "🧪" if p["mode"] == "paper" else ""
         out.append(
             f"\n{dot} <b>{html.escape(p['name'] or p['mint'][:6])}</b> "
@@ -2102,6 +2252,10 @@ async def _status_page() -> Tuple[str, InlineKeyboardMarkup]:
             f"Signals (last hour)  <code>{len([t for t in _flow['signals'] if time.time() - t < 3600])}</code>"
             f" / target <code>{FLOW_TARGET_PER_HOUR}</code>\n"
             f"Score threshold      <code>{_flow['min_score']:.2f}</code> <i>(self-tunes)</i>\n\n"
+            f"<b>Apex Scalp</b>\n"
+            f"Signals (last hour)  <code>{len([t for t in _scalp['signals'] if time.time() - t < 3600])}</code>"
+            f" / target <code>{SCALP_TARGET_PER_HOUR}</code>\n"
+            f"Score threshold      <code>{_scalp['min_score']:.2f}</code> <i>(self-tunes)</i>\n\n"
             f"<b>Top rejections</b>\n{rtxt}\n\n"
             f"<b>Helius credits (est.)</b>\n"
             f"Today <code>{today:,}</code> · Month <code>{month:,}</code> / "
@@ -2159,6 +2313,9 @@ async def cb_how(q: CallbackQuery):
         "<b>3 · Enter</b> — your fixed size, never more, via Jupiter.\n\n"
         "<b>4 · Manage</b> — your exit profile, a −45% hard stop, a 25% trailing stop "
         "after +100%, and a 72-hour time-stop.\n\n"
+        "<b>🗡 Scalp mode</b> takes almost anything that is moving, then gets out fast: +15% sells half, "
+        "+35% the rest, −10% from the peak or −15% from entry exits, 3 flat minutes exits. "
+        "A circuit breaker stops it after a bad streak.\n\n"
         "<b>🌊 Flow mode</b> trades the same safety basics but scores momentum — buy pressure, "
         "curve speed, holder spread — and drops bundled launches and dumping devs. It tunes "
         "itself toward ~20 entries an hour.\n\n"
