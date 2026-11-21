@@ -535,12 +535,24 @@ def extract_pump(tx: Dict) -> Optional[Pool]:
                 dev_pct0=dev_tokens / PUMP_SUPPLY * 100.0)
 
 
-async def _pump_supply(mint: str) -> float:
-    r = await _h("getTokenSupply", [mint])
-    try:
-        return float(r["value"]["uiAmount"])
-    except Exception:
-        return float(PUMP_SUPPLY)
+PUMP_PROGRAM_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+_curve_cache: Dict[str, str] = {}
+
+
+def curve_pda(mint: str) -> str:
+    """The pump.fun bonding-curve account for a mint. Its token account is the curve's inventory.
+    (Some launches have 2B supply, with a second ~1B vault run by pump.fun's agent — so we can't
+    just take the biggest vault; we look for the one the curve PDA owns.)"""
+    if mint not in _curve_cache:
+        try:
+            from solders.pubkey import Pubkey
+            _curve_cache[mint] = str(Pubkey.find_program_address(
+                [b"bonding-curve", bytes(Pubkey.from_string(mint))], Pubkey.from_string(PUMP_PROGRAM_ID))[0])
+        except Exception:
+            return ""                                   # malformed mint: fall back to the biggest vault
+        if len(_curve_cache) > 5000:
+            _curve_cache.pop(next(iter(_curve_cache)))
+    return _curve_cache[mint]
 
 
 def pump_real_sol(curve_tokens_ui: float) -> float:
@@ -565,7 +577,7 @@ def _reject(reason: str, permanent: bool = False) -> Verdict:
     return Verdict(False, reason, permanent)
 
 
-async def _holder_view(mint: str, supply_ui: float):
+async def _holder_view(mint: str, supply_ui: float, curve_owner: Optional[str] = None):
     """([(owner, pct_of_supply)] for real wallets only, biggest vault balance, wallet balances).
     Pool vaults / bonding curves are program-owned (off-curve) and excluded from holders."""
     res = await _h("getTokenLargestAccounts", [mint, {"commitment": "confirmed"}])
@@ -578,12 +590,15 @@ async def _holder_view(mint: str, supply_ui: float):
     vals = (infos or {}).get("value") or []
     held: Dict[str, float] = {}
     vault_max = 0.0
+    curve_bal: Optional[float] = None
     for a, info in zip(accts, vals):
         try:
             owner = info["data"]["parsed"]["info"]["owner"]
         except Exception:
             continue
         ui = float(a.get("uiAmount") or 0)
+        if curve_owner and owner == curve_owner:
+            curve_bal = ui
         if ui <= 0:
             continue
         if is_wallet_address(owner):
@@ -591,7 +606,8 @@ async def _holder_view(mint: str, supply_ui: float):
         else:
             vault_max = max(vault_max, ui)
     return (sorted(((o, v / supply_ui * 100.0) for o, v in held.items()),
-                   key=lambda x: -x[1]), vault_max, sorted(held.values(), reverse=True))
+                   key=lambda x: -x[1]), (curve_bal if curve_bal is not None else vault_max),
+            sorted(held.values(), reverse=True))
 
 
 async def stage1(pool: Pool) -> Verdict:
@@ -736,7 +752,11 @@ async def pump_final(pool: Pool) -> Verdict:
         return _reject("mint_authority", permanent=True)
     if parsed.get("freezeAuthority"):
         return _reject("freeze_authority", permanent=True)
-    v = await _jupiter_checks(pool.mint, dec, PUMP_SUPPLY)
+    try:
+        supply_ui = int(parsed["supply"]) / 10 ** dec
+    except Exception:
+        supply_ui = float(PUMP_SUPPLY)
+    v = await _jupiter_checks(pool.mint, dec, supply_ui)
     if v.ok:
         v.data["decimals"] = dec
     return v
@@ -1394,7 +1414,7 @@ async def pump_pipeline(pool: Pool):
     first_pass = True
     prev_sol: Optional[float] = None
     final: Optional[Verdict] = None
-    supply: Optional[float] = None
+    curve_owner = curve_pda(pool.mint)
     try:
         for i, age in enumerate(PUMP_CHECK_AGES):
             wait = pool.ts + age - time.time()
@@ -1408,13 +1428,8 @@ async def pump_pipeline(pool: Pool):
             if not (want_apex or want_flow or want_scalp) or not await _budget_ok():
                 return
             last = i == len(PUMP_CHECK_AGES) - 1
-            if supply is None:
-                supply = await _pump_supply(pool.mint)
-                if abs(supply - PUMP_SUPPLY) > 0.01 * PUMP_SUPPLY:
-                    _count_reject("odd_supply")            # non-standard curve: the maths doesn't apply
-                    return
             async with _pipeline_sem:
-                hv = await _holder_view(pool.mint, supply)
+                hv = await _holder_view(pool.mint, PUMP_SUPPLY, curve_owner)
             if hv is None:
                 if last:
                     _count_reject("holders_unreadable")
