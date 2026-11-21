@@ -63,6 +63,16 @@ PUMP_START_SOL = 30.0                  # virtual SOL at launch
 PUMP_CHECK_AGES = [60, 120, 180, 240, 330, 450, 600]   # seconds after launch
 PUMP_MAX_WATCHERS = 60                 # cap on coins being re-checked at once (credit guard)
 
+# Apex FLOW (the high-frequency entry strategy)
+FLOW_TARGET_PER_HOUR = 20
+FLOW_MAX_DEV = 8.0                     # dev's opening buy, % of supply
+FLOW_MIN_BUYERS = 3                    # unique non-dev wallets in the top-20 holder list
+FLOW_TOP10 = 45.0
+FLOW_MAX_CLUSTER = 4                   # 4+ wallets with near-identical balances = bundled launch
+FLOW_MIN_SOL = 1.0                     # SOL actually raised on the curve (kills dead launches)
+FLOW_CHECKS = 2                        # evaluated at the first two check times (T+60s, T+120s)
+FLOW_SCORE_START, FLOW_SCORE_FLOOR, FLOW_SCORE_CAP = 0.55, 0.30, 0.80
+
 # Execution
 ENTRY_SLIPPAGE_BPS = 1500          # 15%
 EXIT_SLIPPAGE_BPS = 2000           # 20%
@@ -308,7 +318,8 @@ async def init_db():
                 mode      TEXT NOT NULL DEFAULT 'live',
                 paused    INTEGER NOT NULL DEFAULT 0,
                 low_alert REAL NOT NULL DEFAULT 0,
-                risk_ack  INTEGER NOT NULL DEFAULT 0
+                risk_ack  INTEGER NOT NULL DEFAULT 0,
+                entry     TEXT NOT NULL DEFAULT 'apex'
             );
             CREATE TABLE IF NOT EXISTS apex_positions (
                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -344,6 +355,11 @@ async def init_db():
         await db.commit()
         try:
             await db.execute("ALTER TABLE apex_settings ADD COLUMN risk_ack INTEGER NOT NULL DEFAULT 0")
+            await db.commit()
+        except Exception:
+            pass                                    # column already exists
+        try:
+            await db.execute("ALTER TABLE apex_settings ADD COLUMN entry TEXT NOT NULL DEFAULT 'apex'")
             await db.commit()
         except Exception:
             pass                                    # column already exists
@@ -515,7 +531,7 @@ def _reject(reason: str, permanent: bool = False) -> Verdict:
 
 
 async def _holder_view(mint: str, supply_ui: float):
-    """([(owner, pct_of_supply)] for real wallets only, biggest vault balance).
+    """([(owner, pct_of_supply)] for real wallets only, biggest vault balance, wallet balances).
     Pool vaults / bonding curves are program-owned (off-curve) and excluded from holders."""
     res = await _h("getTokenLargestAccounts", [mint, {"commitment": "confirmed"}])
     accts = (res or {}).get("value") or []
@@ -540,7 +556,7 @@ async def _holder_view(mint: str, supply_ui: float):
         else:
             vault_max = max(vault_max, ui)
     return (sorted(((o, v / supply_ui * 100.0) for o, v in held.items()),
-                   key=lambda x: -x[1]), vault_max)
+                   key=lambda x: -x[1]), vault_max, sorted(held.values(), reverse=True))
 
 
 async def stage1(pool: Pool) -> Verdict:
@@ -1042,11 +1058,14 @@ async def housekeeping_loop():
         await asyncio.sleep(30)
         try:
             await _flush_credits()
+            flow_tune(time.time(), any(u.get("entry") == "flow" for u in await _active_users()))
             global _last_summary
             if time.time() - _last_summary > 300:
                 _last_summary = time.time()
                 today, month = await credits_used()
                 top = sorted(_reject_reasons.items(), key=lambda x: -x[1])[:3]
+                logger.info(f"APEX flow: threshold={_flow['min_score']:.2f} "
+                            f"signals_last_hour={len([t for t in _flow['signals'] if time.time() - t < 3600])}")
                 logger.info(f"APEX summary: launches={_stats['events']} stage1={_stats['stage1_pass']} "
                             f"confirmed={_stats['confirmed']} entries={_stats['entries']} "
                             f"idle_skips={_stats['idle_skips']} top_rejects={top} "
@@ -1098,42 +1117,163 @@ def _count_reject(reason: str):
 _pump_watchers = 0
 _last_summary = 0.0
 
+# ── DexScreener (free, no Helius credits) ────────────────────────────────────
+_dex_sem = asyncio.Semaphore(2)
+_dex_cache: Dict[str, Tuple[float, Optional[Dict]]] = {}
 
-async def _finish_entry(pool: Pool, dec: int, mcap: float):
+
+async def dex_metrics(mint: str) -> Optional[Dict]:
+    """5-minute buys/sells, volume and price change from DexScreener. None if not indexed yet."""
+    hit = _dex_cache.get(mint)
+    if hit and time.time() - hit[0] < 20:
+        return hit[1]
+    out = None
+    try:
+        async with _dex_sem:
+            async with aiohttp.ClientSession(headers={"User-Agent": "Mozilla/5.0",
+                                                      "Accept": "application/json"}) as sess:
+                async with sess.get(f"https://api.dexscreener.com/latest/dex/tokens/{mint}",
+                                    timeout=aiohttp.ClientTimeout(total=6)) as r:
+                    if r.status == 200:
+                        pairs = [p for p in (await r.json()).get("pairs") or []
+                                 if p.get("chainId") == "solana"]
+                        if pairs:
+                            p = pairs[0]
+                            m5 = (p.get("txns") or {}).get("m5") or {}
+                            out = {"buys5": int(m5.get("buys") or 0), "sells5": int(m5.get("sells") or 0),
+                                   "vol5": float((p.get("volume") or {}).get("m5") or 0),
+                                   "chg5": float((p.get("priceChange") or {}).get("m5") or 0),
+                                   "mcap": float(p.get("marketCap") or 0)}
+    except Exception as e:
+        logger.debug(f"dexscreener: {e}")
+    _dex_cache[mint] = (time.time(), out)
+    return out
+
+
+def cluster_size(amounts: List[float], tol: float = 0.015) -> int:
+    """Largest group of wallets whose balances are within `tol` of each other.
+    Bundled launches spread supply over many fresh wallets holding near-identical amounts."""
+    a = sorted(x for x in amounts if x > 0)
+    best, j = 0, 0
+    for i in range(len(a)):
+        while a[i] > a[j] * (1 + tol):
+            j += 1
+        best = max(best, i - j + 1)
+    return best
+
+
+def flow_score(buyers: int, top10: float, real_sol: float, age_s: float,
+               dex: Optional[Dict]) -> float:
+    """0..1 momentum score. DexScreener terms are dropped (and weights renormalised) if unavailable."""
+    parts = [(0.25, min(1.0, buyers / 12)),
+             (0.10, max(0.0, 1 - top10 / FLOW_TOP10)),
+             (0.20, min(1.0, (real_sol / max(age_s / 60, 0.5)) / 3.0))]     # SOL raised per minute
+    if dex:
+        n = dex["buys5"] + dex["sells5"]
+        pressure = dex["buys5"] / n if n else 0.5
+        chg = dex["chg5"]
+        sweet = (1.0 if 0 <= chg <= 150 else 0.5 if 150 < chg <= 400
+                 else 0.3 if -20 <= chg < 0 else 0.0)                      # trending, not already parabolic
+        parts += [(0.20, min(1.0, max(0.0, (pressure - 0.45) / 0.30))),    # buy pressure
+                  (0.10, min(1.0, n / 40)),                                # activity
+                  (0.15, sweet)]
+    w = sum(x for x, _ in parts)
+    return sum(x * v for x, v in parts) / w
+
+
+_flow = {"min_score": FLOW_SCORE_START, "signals": [], "active_since": 0.0}
+
+
+def flow_evaluate(pool: Pool, holders, amounts, real_sol: float, age_s: float,
+                  dex: Optional[Dict]) -> Tuple[bool, str, float]:
+    """(ok, reason, score). Reasons other than 'score_low' are final for this coin."""
+    if pool.dev_pct0 > FLOW_MAX_DEV:
+        return False, "dev_over_8", 0.0
+    if holders and holders[0][1] > MAX_SINGLE_PCT:
+        return False, "whale_over_15", 0.0
+    top10 = sum(p for _, p in holders[:10])
+    if top10 > FLOW_TOP10:
+        return False, "top10_over_45", 0.0
+    if pool.dev_pct0 >= 1.0 and not any(o == pool.dev for o, _ in holders):
+        return False, "dev_sold", 0.0
+    if cluster_size(amounts) >= FLOW_MAX_CLUSTER:
+        return False, "bundled", 0.0
+    buyers = sum(1 for o, _ in holders if o != pool.dev)
+    if buyers < FLOW_MIN_BUYERS:
+        return False, "few_buyers", 0.0
+    if real_sol < FLOW_MIN_SOL:
+        return False, "curve_idle", 0.0
+    sc = flow_score(buyers, top10, real_sol, age_s, dex)
+    if sc < _flow["min_score"]:
+        return False, "score_low", sc
+    return True, "", sc
+
+
+def flow_tune(now: float, flow_users_active: bool):
+    """Steer the score threshold toward ~20 signals an hour: loosen when short, tighten when flooded."""
+    if not flow_users_active:
+        _flow["active_since"] = 0.0
+        return
+    if not _flow["active_since"]:
+        _flow["active_since"] = now
+        return
+    _flow["signals"] = [t for t in _flow["signals"] if now - t < 3600]
+    ran = min(3600.0, now - _flow["active_since"])
+    if ran < 900:
+        return                                       # need 15 minutes of history before steering
+    expected = FLOW_TARGET_PER_HOUR * ran / 3600
+    n = len(_flow["signals"])
+    if n < expected * 0.9:
+        _flow["min_score"] = max(FLOW_SCORE_FLOOR, round(_flow["min_score"] - 0.03, 3))
+    elif n > expected * 1.8:
+        _flow["min_score"] = min(FLOW_SCORE_CAP, round(_flow["min_score"] + 0.03, 3))
+
+
+async def _finish_entry(pool: Pool, dec: int, mcap: float, entry: str = "apex"):
     meta = await _das("getAsset", {"id": pool.mint}) or {}
     md = (meta.get("content") or {}).get("metadata") or {}
     name = md.get("name") or pool.mint[:6]
     symbol = md.get("symbol") or "?"
+    if entry == "flow":
+        _flow["signals"].append(time.time())
     for u in await _active_users():
-        asyncio.create_task(_enter_one(u, pool.mint, name, symbol, dec, mcap))
-    logger.info(f"APEX PASS [{pool.kind}] {name} ({pool.mint[:8]}) mcap=${mcap:,.0f}")
+        if u.get("entry", "apex") == entry:
+            asyncio.create_task(_enter_one(u, pool.mint, name, symbol, dec, mcap))
+    logger.info(f"APEX PASS [{entry}/{pool.kind}] {name} ({pool.mint[:8]}) mcap=${mcap:,.0f}")
 
 
 async def pump_pipeline(pool: Pool):
     """
-    pump.fun launches. Same gates as the Raydium path, adapted to a bonding curve:
-      free  : dev's initial buy <= 5% (read straight from the webhook payload)
-      T+60s : holders (2 calls) -> top10/whale/dev gates, 5+ unique buyers
-              curve liquidity is derived from the curve's token balance (free)
-      later : re-check at a few widening intervals until liquidity >= $3,000
-    A bonding curve cannot be pulled by the dev, which is the curve-stage equivalent
-    of 'LP burned or locked'.
+    pump.fun launches, for whichever entry strategies have a running user:
+
+    PRECISION  free dev<=5% -> T+60 holders (5+ unique buyers, whale/top10/dev gates)
+               -> wait for curve liquidity >= $3,000 (re-checks out to 10 min) -> final safety.
+    FLOW       free dev<=8% -> T+60 / T+120 holders + DexScreener momentum, bundle and dev-sold
+               detection, scored; the score threshold self-tunes toward ~20 signals an hour.
+    Both share one holder lookup per check, so running both costs no more credits.
     """
     global _pump_watchers
-    if pool.dev_pct0 > MAX_DEV_PCT:
-        _count_reject("dev_over_5")
+    users = await _active_users()
+    want_apex = any(u.get("entry", "apex") == "apex" for u in users) and pool.dev_pct0 <= MAX_DEV_PCT
+    want_flow = any(u.get("entry") == "flow" for u in users) and pool.dev_pct0 <= FLOW_MAX_DEV
+    if not (want_apex or want_flow):
+        _count_reject("dev_over_8" if any(u.get("entry") == "flow" for u in users) else "dev_over_5")
         return
     if _pump_watchers >= PUMP_MAX_WATCHERS:
         _count_reject("capacity")
         return
     _pump_watchers += 1
     first_pass = True
+    final: Optional[Verdict] = None
     try:
         for i, age in enumerate(PUMP_CHECK_AGES):
             wait = pool.ts + age - time.time()
             if wait > 0:
                 await asyncio.sleep(wait)
-            if not await _budget_ok() or not await _active_users():
+            users = await _active_users()
+            want_apex = want_apex and any(u.get("entry", "apex") == "apex" for u in users)
+            want_flow = want_flow and i < FLOW_CHECKS and any(u.get("entry") == "flow" for u in users)
+            if not (want_apex or want_flow) or not await _budget_ok():
                 return
             last = i == len(PUMP_CHECK_AGES) - 1
             async with _pipeline_sem:
@@ -1142,40 +1282,74 @@ async def pump_pipeline(pool: Pool):
                 if last:
                     _count_reject("holders_unreadable")
                 continue
-            holders, curve_ui = hv
-            if holders and holders[0][1] > MAX_SINGLE_PCT:
-                _count_reject("whale_over_15")
-                return
-            if sum(p for _, p in holders[:10]) > MAX_TOP10_PCT:
-                _count_reject("top10_over_40")
-                return
-            if next((p for o, p in holders if o == pool.dev), 0.0) > MAX_DEV_PCT:
-                _count_reject("dev_over_5")
-                return
-            buyers = sum(1 for o, _ in holders if o != pool.dev)
-            if buyers < MIN_UNIQUE_BUYERS:
-                # Strategy rule: 5 unique buyers within the first 60 seconds, or it's out.
-                # Dropping these here keeps the re-check queue (and credits) for real contenders.
-                _count_reject("few_buyers")
-                return
-            if first_pass:
-                first_pass = False
-                _stats["stage1_pass"] += 1
+            holders, curve_ui, amounts = hv
             px = await sol_usd()
-            if pump_real_sol(curve_ui) * px < MIN_POOL_USD:
-                if last:
-                    _count_reject("liquidity_low")
-                continue
-            async with _pipeline_sem:
-                v = await pump_final(pool)
-            if not v.ok:
-                _count_reject(v.reason)
-                if v.permanent:
-                    await blacklist_add(pool.mint, v.reason)
+            real_sol = pump_real_sol(curve_ui)
+
+            # ---------------- FLOW
+            if want_flow:
+                dex = await dex_metrics(pool.mint)
+                ok, why, sc = flow_evaluate(pool, holders, amounts, real_sol,
+                                            max(1.0, time.time() - pool.ts), dex)
+                if ok:
+                    want_flow = False
+                    if final is None:
+                        async with _pipeline_sem:
+                            final = await pump_final(pool)
+                    if final.ok:
+                        _stats["flow_signals"] = _stats.get("flow_signals", 0) + 1
+                        await _finish_entry(pool, final.data["decimals"], final.data["mcap"], "flow")
+                    else:
+                        _count_reject("flow_" + final.reason)
+                        if final.permanent:
+                            await blacklist_add(pool.mint, final.reason)
+                            return
+                elif why != "score_low":
+                    want_flow = False
+                    _count_reject("flow_" + why)
+                elif i == FLOW_CHECKS - 1:
+                    want_flow = False
+                    _count_reject("flow_score_low")
+
+            # ---------------- PRECISION
+            if want_apex:
+                top10 = sum(p for _, p in holders[:10])
+                buyers = sum(1 for o, _ in holders if o != pool.dev)
+                reason = ""
+                if holders and holders[0][1] > MAX_SINGLE_PCT:
+                    reason = "whale_over_15"
+                elif top10 > MAX_TOP10_PCT:
+                    reason = "top10_over_40"
+                elif next((p for o, p in holders if o == pool.dev), 0.0) > MAX_DEV_PCT:
+                    reason = "dev_over_5"
+                elif buyers < MIN_UNIQUE_BUYERS:
+                    reason = "few_buyers"      # 5 unique buyers in the first 60s, or it's out
+                if reason:
+                    _count_reject(reason)
+                    want_apex = False
+                else:
+                    if first_pass:
+                        first_pass = False
+                        _stats["stage1_pass"] += 1
+                    if real_sol * px >= MIN_POOL_USD:
+                        want_apex = False
+                        if final is None:
+                            async with _pipeline_sem:
+                                final = await pump_final(pool)
+                        if final.ok:
+                            _stats["confirmed"] += 1
+                            await _finish_entry(pool, final.data["decimals"], final.data["mcap"], "apex")
+                        else:
+                            _count_reject(final.reason)
+                            if final.permanent:
+                                await blacklist_add(pool.mint, final.reason)
+                                return
+                    elif last:
+                        _count_reject("liquidity_low")
+                        want_apex = False
+
+            if not (want_apex or want_flow):
                 return
-            _stats["confirmed"] += 1
-            await _finish_entry(pool, v.data["decimals"], v.data["mcap"])
-            return
     finally:
         _pump_watchers -= 1
 
@@ -1301,6 +1475,7 @@ async def _home(uid: int, banner: str = "") -> Tuple[str, InlineKeyboardMarkup]:
         (f"{banner}\n\n" if banner else "") +
         f"<b>◆ CLEX APEX</b>\n<i>Precision entries on fresh Solana launches.</i>\n{RULE}\n"
         f"<code>Sniper   </code><b>{state}</b>\n"
+        f"<code>Entry    </code>{ENTRIES[s.get('entry', 'apex')]['icon']} {ENTRIES[s.get('entry', 'apex')]['name']}\n"
         f"<code>Exit     </code>{prof['icon']} {prof['name']}\n"
         f"<code>Size     </code>{size}"
         + (f" ≈ {s['size_sol'] * px:.2f} USD" if s["size_sol"] and px else "") + "\n"
@@ -1329,16 +1504,46 @@ WELCOME = (
     "<b>Three quick steps:</b> exit strategy, trade size, wallet.")
 
 
-async def _strategy_page() -> Tuple[str, InlineKeyboardMarkup]:
-    lines = ["<b>🧭 Exit Strategy</b>\n" + RULE + "\nPick how Apex takes profit. "
-             "Applies to every <i>new</i> trade.\n"]
+ENTRIES = {
+    "apex": {"icon": "🎯", "name": "Apex Precision",
+             "blurb": "Strict gauntlet. Few trades, all conditions must clear, entries once a coin "
+                      "has real liquidity."},
+    "flow": {"icon": "🌊", "name": "Apex Flow",
+             "blurb": "Looser, faster. Aims for ~20 entries an hour and picks the strongest "
+                      "momentum, filtering out bundled launches, dumping devs and whales."},
+}
+
+
+async def _strategy_page(uid: int = 0) -> Tuple[str, InlineKeyboardMarkup]:
+    cur = "apex"
+    if uid:
+        s, _ = await get_settings(uid)
+        cur = (s or {}).get("entry", "apex")
+    lines = [f"<b>🧭 Strategy</b>\n{RULE}\n<b>1 · Entry — what to buy</b>"]
+    for k, e in ENTRIES.items():
+        lines.append(f"\n{'✅' if k == cur else '▫️'} <b>{e['icon']} {e['name']}</b>\n<i>{e['blurb']}</i>")
+    lines.append(f"\n{RULE}\n<b>2 · Exit — how to take profit</b> <i>(applies to every new trade)</i>")
     for k, p in PROFILES.items():
         lines.append(f"\n<b>{k} · {p['icon']} {p['name']}</b>\n<i>{p['blurb']}</i>\n" +
                      "\n".join(f"  • {r}" for r in p["rows"]))
     lines.append("\n\n<b>Always on:</b> −45% hard stop · 72h time-stop if flat.")
-    kb = _kb([[(f"{k} · {p['name']}", f"ax:prof:{k}")] for k, p in PROFILES.items()] +
+    kb = _kb([[(("✅ " if k == cur else "") + f"{e['icon']} {e['name']}", f"ax:ent:{k}")]
+              for k, e in ENTRIES.items()] +
+             [[(f"{k} · {p['name']}", f"ax:prof:{k}")] for k, p in PROFILES.items()] +
              [HOME_BTN])
     return "\n".join(lines), kb
+
+
+@router.callback_query(F.data.startswith("ax:ent:"))
+async def cb_ent(q: CallbackQuery):
+    k = q.data.split(":")[2]
+    if k not in ENTRIES:
+        await q.answer("Unknown strategy")
+        return
+    await get_settings(q.from_user.id, create=True)
+    await set_setting(q.from_user.id, entry=k)
+    t, kb = await _strategy_page(q.from_user.id)
+    await _send(q, f"✅ Entry strategy set to <b>{ENTRIES[k]['name']}</b>.\n\n" + t, kb)
 
 
 def _size_page(s: Dict) -> Tuple[str, InlineKeyboardMarkup]:
@@ -1356,7 +1561,7 @@ async def cmd_start(m: Message):
     s, new = await get_settings(m.from_user.id, create=True)
     if new:
         _wizard.add(m.from_user.id)
-        t, kb = await _strategy_page()
+        t, kb = await _strategy_page(m.from_user.id)
         await m.answer(WELCOME, parse_mode=ParseMode.HTML)
         await m.answer("<b>Step 1 of 2</b> — " + t, parse_mode=ParseMode.HTML, reply_markup=kb)
         return
@@ -1366,7 +1571,7 @@ async def cmd_start(m: Message):
 
 @router.message(Command("settings"))
 async def cmd_settings(m: Message):
-    t, kb = await _strategy_page()
+    t, kb = await _strategy_page(m.from_user.id)
     await _send(m, t, kb)
 
 
@@ -1379,7 +1584,7 @@ async def cb_home(q: CallbackQuery):
 
 @router.callback_query(F.data == "ax:strat")
 async def cb_strat(q: CallbackQuery):
-    t, kb = await _strategy_page()
+    t, kb = await _strategy_page(q.from_user.id)
     await _send(q, t, kb)
 
 
@@ -1891,6 +2096,10 @@ async def _status_page() -> Tuple[str, InlineKeyboardMarkup]:
             f"Passed stage 1    <code>{_stats['stage1_pass']}</code>\n"
             f"Fully confirmed   <code>{_stats['confirmed']}</code>\n"
             f"Entries           <code>{_stats['entries']}</code>\n\n"
+            f"<b>Apex Flow</b>\n"
+            f"Signals (last hour)  <code>{len([t for t in _flow['signals'] if time.time() - t < 3600])}</code>"
+            f" / target <code>{FLOW_TARGET_PER_HOUR}</code>\n"
+            f"Score threshold      <code>{_flow['min_score']:.2f}</code> <i>(self-tunes)</i>\n\n"
             f"<b>Top rejections</b>\n{rtxt}\n\n"
             f"<b>Helius credits (est.)</b>\n"
             f"Today <code>{today:,}</code> · Month <code>{month:,}</code> / "
@@ -1948,6 +2157,9 @@ async def cb_how(q: CallbackQuery):
         "<b>3 · Enter</b> — your fixed size, never more, via Jupiter.\n\n"
         "<b>4 · Manage</b> — your exit profile, a −45% hard stop, a 25% trailing stop "
         "after +100%, and a 72-hour time-stop.\n\n"
+        "<b>🌊 Flow mode</b> trades the same safety basics but scores momentum — buy pressure, "
+        "curve speed, holder spread — and drops bundled launches and dumping devs. It tunes "
+        "itself toward ~20 entries an hour.\n\n"
         "<i>Most launches fail. That's the feature.</i>"), _kb([HOME_BTN]))
 
 
