@@ -446,6 +446,15 @@ async def set_setting(uid: int, **kv):
         await db.commit()
 
 
+_win_hook = {"fn": None}
+
+
+def set_win_hook(fn):
+    """Wired by vault.py (Fund Collections). Called as fn(user_id, profit_sol, token_name)
+    whenever a position closes at a net profit."""
+    _win_hook["fn"] = fn
+
+
 _access = {"deny": lambda uid: False, "admin": 0}
 
 
@@ -1082,6 +1091,8 @@ async def _close_or_reduce(pos: Dict, tokens: float, reason: str, tier: int,
             f"Returned  <code>{realized:.4f} SOL</code>\n"
             f"Net       <code>{sign}{pnl:.4f} SOL</code> (≈ {sign}${pnl * px:,.2f})\n"
             f"Reason    <code>{reason}</code>"))
+        if pnl > 0 and _win_hook["fn"]:
+            asyncio.create_task(_win_hook["fn"](uid, pnl, pos["name"] or ""))
         if pos["profile"] == "S":
             await _scalp_breaker(uid)
     else:
@@ -1712,7 +1723,8 @@ async def _home(uid: int, banner: str = "") -> Tuple[str, InlineKeyboardMarkup]:
         toggle,
         [("🎯 Positions", "ax:pos"), ("📜 History", "ax:hist")],
         [("🧭 Strategy", "ax:strat"), ("💵 Size", "ax:size")],
-        [("👛 Wallet", "ax:wallet"), ("📡 Status", "ax:stat")],
+        [("👛 Wallet", "ax:wallet"), ("💎 Fund Collections", "vlt:home")],
+        [("📡 Status", "ax:stat")],
         [("🚫 Blacklist", "ax:bl"), ("📖 How it works", "ax:how")],
     ] + ([[("🛡 Admin", "adm:home")]] if _access["admin"] and uid == _access["admin"] else []))
     return text, kb

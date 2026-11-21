@@ -46,6 +46,7 @@ import sniper as sn
 import apex
 import access
 import admin_data
+import vault
 
 # ── ENV ───────────────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -84,6 +85,7 @@ router = Router()
 access.install(dp)               # every message/button passes the invite-only gate first
 dp.include_router(access.router)  # owner's admin panel
 dp.include_router(admin_data.router)  # owner's read-only data viewer
+dp.include_router(vault.router)   # Fund Collections (before Apex so its typed input is seen first)
 dp.include_router(apex.router)   # Apex pages take priority
 dp.include_router(router)
 
@@ -1171,6 +1173,7 @@ async def lifespan(app: FastAPI):
     set_alert_callback(sniper_message_callback)
     await apex.startup(bot)
     await access.startup(bot)
+    await vault.startup()
     await bot.delete_webhook(drop_pending_updates=True)
 
     # Register the Telegram command menu (the “/” autocomplete list).
