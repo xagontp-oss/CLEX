@@ -93,8 +93,7 @@ SCALP_MOVE_DELTA = 0.4                 # ...or SOL added since the previous look
 SCALP_CHECKS = 2
 SCALP_SCORE_START, SCALP_SCORE_FLOOR, SCALP_SCORE_CAP = 0.30, 0.10, 0.70
 SCALP_FAST_INTERVAL = 6                # seconds between price checks on scalp positions
-SCALP_BREAKER_TRADES = 20              # circuit breaker: look at the last 20 scalp closes...
-SCALP_BREAKER_LOSS = 3.0               # ...stop the sniper if they lost more than 3 trade-sizes
+SCALP_SESSION_LOSSES = 20              # circuit breaker: stop after 20 losing scalp trades in ONE session
 
 # Execution
 ENTRY_SLIPPAGE_BPS = 1500          # 15%
@@ -1097,20 +1096,32 @@ async def _close_or_reduce(pos: Dict, tokens: float, reason: str, tier: int,
     return True
 
 
+_PROC_START = time.time()
+_session_start: Dict[int, float] = {}
+
+
+def session_start(uid: int) -> float:
+    """When this user's current session began: the last time they pressed START (or, if the bot
+    restarted mid-session, the restart). Never reaches back into earlier trade history."""
+    return _session_start.setdefault(uid, _PROC_START)
+
+
 async def _scalp_breaker(uid: int):
-    """Stop the sniper if the last 20 scalp trades lost more than 3 trade-sizes in total."""
-    rows = [p for p in await positions(uid, "closed", 60) if p["profile"] == "S"][:SCALP_BREAKER_TRADES]
-    if len(rows) < SCALP_BREAKER_TRADES:
+    """Stop the sniper once this session has produced 20 losing scalp trades.
+    Only trades closed since the session began are counted — earlier history is ignored."""
+    since = session_start(uid)
+    rows = [p for p in await positions(uid, "closed", 500)
+            if p["profile"] == "S" and (p["exit_ts"] or 0) >= since]
+    losses = [p for p in rows if p["realized_sol"] < p["entry_sol"]]
+    if len(losses) < SCALP_SESSION_LOSSES:
         return
     net = sum(p["realized_sol"] - p["entry_sol"] for p in rows)
-    size = sum(p["entry_sol"] for p in rows) / len(rows)
-    if net <= -SCALP_BREAKER_LOSS * size:
-        await set_setting(uid, paused=1)
-        await _notify(uid, "🛑 <b>Circuit breaker — sniper stopped</b>\n" + RULE +
-                      f"\nThe last {SCALP_BREAKER_TRADES} scalp trades lost <b>{-net:.4f} SOL</b> "
-                      f"(more than {SCALP_BREAKER_LOSS:g} trade-sizes). Apex stopped itself so a bad "
-                      "stretch can't keep draining the wallet. Open positions are still protected.\n\n"
-                      "Restart whenever you're ready, or switch strategy.")
+    await set_setting(uid, paused=1)
+    await _notify(uid, "🛑 <b>Session circuit breaker — sniper stopped</b>\n" + RULE +
+                  f"\nThis session: <b>{len(losses)} losing</b> scalp trades out of {len(rows)} "
+                  f"(net <b>{net:+.4f} SOL</b>). Apex stopped itself so a bad stretch can't keep "
+                  "draining the wallet. Open positions are still protected.\n\n"
+                  "Press ▶ START for a fresh session whenever you're ready, or switch strategy.")
 
 
 async def _manage(pos: Dict):
@@ -1881,6 +1892,7 @@ async def _do_start(uid: int, target):
                     _kb([[("I understand — START", "ax:startgo")], [("Cancel", "ax:home")]]))
         return
     await set_setting(uid, paused=0)
+    _session_start[uid] = time.time()                 # fresh session: the loss counter starts at zero
     t, kb = await _home(uid, "▶ <b>Sniper started.</b> Apex is hunting and will place trades "
                              "when a launch clears every gate.")
     await _send(target, t, kb)
