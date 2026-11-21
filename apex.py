@@ -58,7 +58,7 @@ MAX_EVENT_AGE_SECS = 120           # ignore stale / backfilled webhook events
 # pump.fun bonding-curve constants (liquidity is read from the curve's token balance, free)
 PUMP_SUPPLY = 1_000_000_000
 PUMP_K = 1_073_000_000 * 30.0          # virtual token reserve x virtual SOL reserve
-PUMP_VIRT_OFFSET = 279_900_000         # virtual tokens - real tokens on the curve
+PUMP_VIRT_OFFSET = 73_000_000          # virtual token reserves = curve account balance + 73M
 PUMP_START_SOL = 30.0                  # virtual SOL at launch
 PUMP_CHECK_AGES = [60, 120, 180, 240, 330, 450, 600]   # seconds after launch
 PUMP_MAX_WATCHERS = 140                # cap on coins being re-checked at once (credit guard)
@@ -535,8 +535,17 @@ def extract_pump(tx: Dict) -> Optional[Pool]:
                 dev_pct0=dev_tokens / PUMP_SUPPLY * 100.0)
 
 
+async def _pump_supply(mint: str) -> float:
+    r = await _h("getTokenSupply", [mint])
+    try:
+        return float(r["value"]["uiAmount"])
+    except Exception:
+        return float(PUMP_SUPPLY)
+
+
 def pump_real_sol(curve_tokens_ui: float) -> float:
-    """SOL actually raised on the bonding curve, derived from the curve's token balance."""
+    """SOL actually raised on the bonding curve, derived from the curve's token balance.
+    Check: balance 1,000M -> 0 SOL (launch); balance 206.9M -> 85 SOL (graduation)."""
     vt = curve_tokens_ui + PUMP_VIRT_OFFSET
     return max(0.0, PUMP_K / vt - PUMP_START_SOL) if vt > 0 else 0.0
 
@@ -1385,6 +1394,7 @@ async def pump_pipeline(pool: Pool):
     first_pass = True
     prev_sol: Optional[float] = None
     final: Optional[Verdict] = None
+    supply: Optional[float] = None
     try:
         for i, age in enumerate(PUMP_CHECK_AGES):
             wait = pool.ts + age - time.time()
@@ -1398,8 +1408,13 @@ async def pump_pipeline(pool: Pool):
             if not (want_apex or want_flow or want_scalp) or not await _budget_ok():
                 return
             last = i == len(PUMP_CHECK_AGES) - 1
+            if supply is None:
+                supply = await _pump_supply(pool.mint)
+                if abs(supply - PUMP_SUPPLY) > 0.01 * PUMP_SUPPLY:
+                    _count_reject("odd_supply")            # non-standard curve: the maths doesn't apply
+                    return
             async with _pipeline_sem:
-                hv = await _holder_view(pool.mint, PUMP_SUPPLY)
+                hv = await _holder_view(pool.mint, supply)
             if hv is None:
                 if last:
                     _count_reject("holders_unreadable")
