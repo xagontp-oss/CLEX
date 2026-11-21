@@ -42,6 +42,12 @@ USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 USDT = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
 QUOTE_MINTS = {WSOL, USDC, USDT}
 TOKEN_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+TOKEN_2022_PROGRAM = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+# Token-2022 extensions that cannot be used to tax, freeze, redirect or confiscate a holder's tokens.
+# pump.fun's current launches carry exactly metadataPointer + tokenMetadata. Anything else
+# (transferFeeConfig, permanentDelegate, transferHook, defaultAccountState, nonTransferable, ...) is out.
+SAFE_2022_EXTENSIONS = {"metadataPointer", "tokenMetadata", "groupPointer", "groupMemberPointer",
+                        "tokenGroup", "tokenGroupMember"}
 
 # Screening
 MIN_SUPPLY, MAX_SUPPLY = 100_000_000, 1_000_000_000_000
@@ -306,6 +312,19 @@ async def _budget_ok() -> bool:
 # ══════════════════════════════════════════════════════════════════════════════
 _P = 2 ** 255 - 19
 _D = (-121665 * pow(121666, -1, _P)) % _P
+
+
+def mint_program_check(owner: str, parsed: Dict) -> Tuple[bool, str]:
+    """(ok, reason). Classic SPL token: fine. Token-2022: only with harmless extensions."""
+    if owner == TOKEN_PROGRAM:
+        return True, ""
+    if owner == TOKEN_2022_PROGRAM:
+        bad = [e.get("extension", "?") for e in (parsed.get("extensions") or [])
+               if e.get("extension") not in SAFE_2022_EXTENSIONS]
+        if bad:
+            return False, "t22_" + str(bad[0])
+        return True, ""
+    return False, "unknown_token_program"
 
 
 def is_wallet_address(addr: str) -> bool:
@@ -631,8 +650,9 @@ async def stage1(pool: Pool) -> Verdict:
         supply_ui = int(parsed["supply"]) / 10 ** decimals
     except Exception:
         return _reject("mint_unreadable")
-    if program != TOKEN_PROGRAM:
-        return _reject("token2022", permanent=True)
+    prog_ok, prog_why = mint_program_check(program, parsed)
+    if not prog_ok:
+        return _reject(prog_why, permanent=True)
     if parsed.get("mintAuthority"):
         return _reject("mint_authority", permanent=True)
     if parsed.get("freezeAuthority"):
@@ -721,11 +741,19 @@ async def _jupiter_checks(mint: str, dec: int, supply_ui: float) -> Verdict:
     """Honeypot / tax / market-cap via Jupiter quotes (no Helius credits)."""
     buy = await jup_quote(WSOL, mint, int(PROBE_SOL * 1e9), ENTRY_SLIPPAGE_BPS)
     if not buy:
+        await asyncio.sleep(1.0)                       # fresh coins / rate limits: one more try
+        buy = await jup_quote(WSOL, mint, int(PROBE_SOL * 1e9), ENTRY_SLIPPAGE_BPS)
+    if not buy:
         return _reject("no_buy_route")
     got = int(buy["outAmount"])
     sell = await jup_quote(mint, WSOL, got, EXIT_SLIPPAGE_BPS)
     if not sell:
-        return _reject("honeypot", permanent=True)
+        await asyncio.sleep(1.0)
+        sell = await jup_quote(mint, WSOL, got, EXIT_SLIPPAGE_BPS)
+    if not sell:
+        # Can't price a sale: don't buy. Not blacklisted forever — a missing route is often just
+        # Jupiter not having indexed a brand-new pool yet, or a rate limit.
+        return _reject("no_sell_route")
     back = int(sell["outAmount"]) / 1e9
     loss_pct = (1 - back / PROBE_SOL) * 100
     if loss_pct > 2 * MAX_TAX_PCT + 8:      # 2 sides of tax + fees/impact allowance
@@ -746,8 +774,9 @@ async def pump_final(pool: Pool) -> Verdict:
         dec = int(parsed["decimals"])
     except Exception:
         return _reject("mint_unreadable")
-    if info["value"].get("owner") != TOKEN_PROGRAM:
-        return _reject("token2022", permanent=True)
+    prog_ok, prog_why = mint_program_check(info["value"].get("owner", ""), parsed)
+    if not prog_ok:
+        return _reject(prog_why, permanent=True)
     if parsed.get("mintAuthority"):
         return _reject("mint_authority", permanent=True)
     if parsed.get("freezeAuthority"):
