@@ -45,6 +45,7 @@ from sniper import (
 import sniper as sn
 import apex
 import access
+import admin_data
 
 # ── ENV ───────────────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -82,6 +83,7 @@ dp     = Dispatcher()
 router = Router()
 access.install(dp)               # every message/button passes the invite-only gate first
 dp.include_router(access.router)  # owner's admin panel
+dp.include_router(admin_data.router)  # owner's read-only data viewer
 dp.include_router(apex.router)   # Apex pages take priority
 dp.include_router(router)
 
