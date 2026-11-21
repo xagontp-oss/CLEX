@@ -61,7 +61,7 @@ PUMP_K = 1_073_000_000 * 30.0          # virtual token reserve x virtual SOL res
 PUMP_VIRT_OFFSET = 279_900_000         # virtual tokens - real tokens on the curve
 PUMP_START_SOL = 30.0                  # virtual SOL at launch
 PUMP_CHECK_AGES = [60, 120, 180, 240, 330, 450, 600]   # seconds after launch
-PUMP_MAX_WATCHERS = 60                 # cap on coins being re-checked at once (credit guard)
+PUMP_MAX_WATCHERS = 140                # cap on coins being re-checked at once (credit guard)
 
 # Apex FLOW (the high-frequency entry strategy)
 FLOW_TARGET_PER_HOUR = 20
@@ -71,7 +71,8 @@ FLOW_TOP10 = 45.0
 FLOW_MAX_CLUSTER = 4                   # 4+ wallets with near-identical balances = bundled launch
 FLOW_MIN_SOL = 1.0                     # SOL actually raised on the curve (kills dead launches)
 FLOW_CHECKS = 2                        # evaluated at the first two check times (T+60s, T+120s)
-FLOW_SCORE_START, FLOW_SCORE_FLOOR, FLOW_SCORE_CAP = 0.55, 0.30, 0.80
+FLOW_SCORE_START, FLOW_SCORE_FLOOR, FLOW_SCORE_CAP = 0.50, 0.30, 0.80
+FLOW_TUNE_WARMUP, FLOW_TUNE_EVERY, FLOW_TUNE_STEP = 600, 300, 0.05
 
 # Execution
 ENTRY_SLIPPAGE_BPS = 1500          # 15%
@@ -1181,7 +1182,7 @@ def flow_score(buyers: int, top10: float, real_sol: float, age_s: float,
     return sum(x * v for x, v in parts) / w
 
 
-_flow = {"min_score": FLOW_SCORE_START, "signals": [], "active_since": 0.0}
+_flow = {"min_score": FLOW_SCORE_START, "signals": [], "active_since": 0.0, "last_tune": 0.0}
 
 
 def flow_evaluate(pool: Pool, holders, amounts, real_sol: float, age_s: float,
@@ -1219,14 +1220,15 @@ def flow_tune(now: float, flow_users_active: bool):
         return
     _flow["signals"] = [t for t in _flow["signals"] if now - t < 3600]
     ran = min(3600.0, now - _flow["active_since"])
-    if ran < 900:
-        return                                       # need 15 minutes of history before steering
+    if ran < FLOW_TUNE_WARMUP or now - _flow["last_tune"] < FLOW_TUNE_EVERY:
+        return                                       # warm up first, then adjust at most every 5 minutes
+    _flow["last_tune"] = now
     expected = FLOW_TARGET_PER_HOUR * ran / 3600
     n = len(_flow["signals"])
     if n < expected * 0.9:
-        _flow["min_score"] = max(FLOW_SCORE_FLOOR, round(_flow["min_score"] - 0.03, 3))
+        _flow["min_score"] = max(FLOW_SCORE_FLOOR, round(_flow["min_score"] - FLOW_TUNE_STEP, 3))
     elif n > expected * 1.8:
-        _flow["min_score"] = min(FLOW_SCORE_CAP, round(_flow["min_score"] + 0.03, 3))
+        _flow["min_score"] = min(FLOW_SCORE_CAP, round(_flow["min_score"] + FLOW_TUNE_STEP, 3))
 
 
 async def _finish_entry(pool: Pool, dec: int, mcap: float, entry: str = "apex"):
@@ -1304,12 +1306,12 @@ async def pump_pipeline(pool: Pool):
                         if final.permanent:
                             await blacklist_add(pool.mint, final.reason)
                             return
-                elif why != "score_low":
+                elif why not in ("score_low", "few_buyers", "curve_idle"):
                     want_flow = False
                     _count_reject("flow_" + why)
-                elif i == FLOW_CHECKS - 1:
+                elif i == FLOW_CHECKS - 1:                  # last look: still too quiet / weak
                     want_flow = False
-                    _count_reject("flow_score_low")
+                    _count_reject("flow_" + why)
 
             # ---------------- PRECISION
             if want_apex:
