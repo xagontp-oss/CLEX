@@ -1,4 +1,4 @@
-# CLEX - Pump.fun Tracker Bot
+# CLEX - SOL Memecoin Trading Agent
 
 Real-time Solana agentic trading bot.
 -Feature packed 
