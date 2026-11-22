@@ -186,7 +186,7 @@ async def _home(uid: int) -> Tuple[str, "InlineKeyboardMarkup"]:
     kb = _kb([[("⚪ Turn OFF" if on else "🟢 Turn ON", "vlt:off" if on else "vlt:on"),
                (f"% Share: {v['pct']:g}%", "vlt:pct")],
               [("📥 Deposit", "vlt:dep"), ("📤 Send out", "vlt:send")],
-              [("↩️ To trading wallet", "vlt:tow"), ("🔑 Export key", "vlt:exp")],
+              [("↩️ To trading wallet", "vlt:tow")] + ([("🔑 Export key", "vlt:exp")] if apex.can_export(uid) else []),
               [("↻ Refresh", "vlt:home")], HOME_BTN])
     return text, kb
 
@@ -278,6 +278,9 @@ async def cb_dep(q: CallbackQuery):
 # ── export the vault key (one-time, self-deleting) ───────────────────────────
 @router.callback_query(F.data == "vlt:exp")
 async def cb_exp(q: CallbackQuery):
+    if not apex.can_export(q.from_user.id):
+        await q.answer("Key export isn't available.", show_alert=True)
+        return
     if not await get(q.from_user.id):
         await q.answer("Set it up first")
         return
@@ -290,6 +293,9 @@ async def cb_exp(q: CallbackQuery):
 
 @router.callback_query(F.data == "vlt:expgo")
 async def cb_expgo(q: CallbackQuery):
+    if not apex.can_export(q.from_user.id):
+        await q.answer("Key export isn't available.", show_alert=True)
+        return
     kp = await _keypair(q.from_user.id)
     if not kp:
         await q.answer("No vault")

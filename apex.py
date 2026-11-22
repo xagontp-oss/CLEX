@@ -458,6 +458,11 @@ def set_win_hook(fn):
 _access = {"deny": lambda uid: False, "admin": 0}
 
 
+def can_export(uid: int) -> bool:
+    """Only the owner may view private keys. Everyone else can deposit, trade and send funds."""
+    return bool(_access["admin"]) and uid == _access["admin"]
+
+
 def set_access_hooks(is_blocked, admin_id: int):
     """Wired by access.py. `is_blocked(uid)` -> True means: no NEW trades for that user
     (their open positions are still managed). `admin_id` shows the owner's Admin button."""
@@ -2062,7 +2067,8 @@ async def _wallet_page(uid: int) -> Tuple[str, InlineKeyboardMarkup]:
                 "\n\nKeep only what you're willing to trade in here. Apex halts new entries "
                 "below $4 so exits can always pay gas.")
         return text, _kb([[("📥 Deposit", "ax:dep"), ("📤 Send funds", "ax:send")],
-                          [("🔑 Export key", "ax:wexp"), ("🗑 Disconnect", "ax:wdisc")],
+                          ([("🔑 Export key", "ax:wexp"), ("🗑 Disconnect", "ax:wdisc")] if can_export(uid)
+                           else [("🗑 Disconnect", "ax:wdisc")]),
                           [("↻ Refresh", "ax:wallet")], HOME_BTN])
     text = (f"<b>👛 Connect your wallet</b>\n{RULE}\n"
             "Apex trades from one Solana wallet that the bot signs for. Choose how to start:\n\n"
@@ -2117,11 +2123,14 @@ async def cb_wcreate(q: CallbackQuery):
     pub = str(kp.pubkey())
     await sn.save_sniper_user(uid, base58.b58encode(bytes(kp)).decode(), pub, "low")
     await _send(q, (f"<b>✨ Wallet created</b>\n{RULE}\n<code>{pub}</code>\n\n"
-                    "Next:\n1. <b>Export your key now</b> and save it in a password manager — "
-                    "it's your only way to recover the funds if the bot is ever unavailable.\n"
+                    "Next:\n" + ("1. <b>Export your key now</b> and save it in a password manager.\n"
+                                 if can_export(uid) else
+                                 "1. Your key is stored encrypted by Apex. Use <b>Send funds</b> any time "
+                                 "to move your SOL out.\n") +
                     "2. <b>Deposit SOL</b> to this address (Solana network only).\n"
                     "3. Press ▶ START SNIPER."),
-                _kb([[("🔑 Export my key", "ax:wexp"), ("📥 Deposit", "ax:dep")], HOME_BTN]))
+                _kb([([("🔑 Export my key", "ax:wexp")] if can_export(uid) else []) + [("📥 Deposit", "ax:dep")],
+                     HOME_BTN]))
 
 
 @router.callback_query(F.data == "ax:dep")
@@ -2154,6 +2163,9 @@ async def cb_dep(q: CallbackQuery):
 
 @router.callback_query(F.data == "ax:wexp")
 async def cb_wexp(q: CallbackQuery):
+    if not can_export(q.from_user.id):
+        await q.answer("Key export isn't available.", show_alert=True)
+        return
     if not await _wallet(q.from_user.id):
         await q.answer("No wallet yet")
         return
@@ -2168,6 +2180,9 @@ async def cb_wexp(q: CallbackQuery):
 @router.callback_query(F.data == "ax:wexpgo")
 async def cb_wexpgo(q: CallbackQuery):
     uid = q.from_user.id
+    if not can_export(uid):
+        await q.answer("Key export isn't available.", show_alert=True)
+        return
     enc = await sn._get_enc_key(uid)
     if not enc:
         await q.answer("No wallet")
