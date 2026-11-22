@@ -2064,7 +2064,7 @@ async def _wallet_page(uid: int) -> Tuple[str, InlineKeyboardMarkup]:
         px = await sol_usd()
         text = (f"<b>👛 Your Apex wallet</b>\n{RULE}\n<code>{w['pubkey']}</code>\n\n"
                 f"Balance  <b>{bal:.4f} SOL</b>" + (f"  ≈ ${bal * px:,.2f}" if px else "") +
-                "\n\nKeep only what you're willing to trade in here. Apex halts new entries "
+                "\n\nKeep your balance you choose trade in here. Apex halts new entries "
                 "below $4 so exits can always pay gas.")
         return text, _kb([[("📥 Deposit", "ax:dep"), ("📤 Send funds", "ax:send")],
                           ([("🔑 Export key", "ax:wexp"), ("🗑 Disconnect", "ax:wdisc")] if can_export(uid)
@@ -2073,11 +2073,11 @@ async def _wallet_page(uid: int) -> Tuple[str, InlineKeyboardMarkup]:
     text = (f"<b>👛 Connect your wallet</b>\n{RULE}\n"
             "Apex trades from one Solana wallet that the bot signs for. Choose how to start:\n\n"
             "<b>👻 Connect my Phantom</b>\n"
-            "Use a Phantom account you already have. Best: a <b>dedicated</b> account holding only "
-            "your trading funds, never your main one.\n\n"
+            "Use your preferred Phantom account! <b>dedicated</b> This will fund all trades "
+            "CLEX trades SOL only.\n\n"
             "<b>✨ Create a new wallet</b>\n"
             "Apex generates a fresh wallet. Fund it from Phantom or anywhere else.\n\n"
-            "⚠️ Either way, the bot holds the key (AES-encrypted). Only fund what you can afford to lose.")
+            "⚠️ Either way, wallets are (AES-encrypted).")
     return text, _kb([[("👻 Connect my Phantom", "ax:wconnect")],
                       [("✨ Create a new wallet", "ax:wcreate")], HOME_BTN])
 
