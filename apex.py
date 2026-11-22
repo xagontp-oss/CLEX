@@ -2073,7 +2073,7 @@ async def _wallet_page(uid: int) -> Tuple[str, InlineKeyboardMarkup]:
     text = (f"<b>👛 Connect your wallet</b>\n{RULE}\n"
             "Apex trades from one Solana wallet that the bot signs for. Choose how to start:\n\n"
             "<b>👻 Connect my Phantom</b>\n"
-            "Use your preferred Phantom account! <b>dedicated</b> This will fund all trades "
+            "Use your preferred Phantom account! This will fund all trades. "
             "CLEX trades SOL only.\n\n"
             "<b>✨ Create a new wallet</b>\n"
             "Apex generates a fresh wallet. Fund it from Phantom or anywhere else.\n\n"
@@ -2095,7 +2095,7 @@ async def cb_wconnect(q: CallbackQuery):
                 "\nIn Phantom: tap the menu ☰ → your account → <b>Show Private Key</b> → "
                 "choose <b>Solana</b> → copy it.\n"
                 "(The recovery phrase won't work — it must be the private key.)\n\n"
-                "Paste it in your next message. I delete your message right away.",
+                "Paste it in your next message. It will be wiped aftr 30 seconds.",
                 _kb([[("Cancel", "ax:home")]]))
 
 
