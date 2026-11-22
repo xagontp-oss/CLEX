@@ -2064,16 +2064,16 @@ async def _wallet_page(uid: int) -> Tuple[str, InlineKeyboardMarkup]:
         return text, _kb([[("📥 Deposit", "ax:dep"), ("📤 Send funds", "ax:send")],
                           [("🔑 Export key", "ax:wexp"), ("🗑 Disconnect", "ax:wdisc")],
                           [("↻ Refresh", "ax:wallet")], HOME_BTN])
-    text = (f"<b>👛 Set up your wallet</b>\n{RULE}\n"
-            "Apex trades from its own Solana wallet. Pick one:\n\n"
-            "<b>✨ Create a new wallet</b> <i>(recommended)</i>\n"
-            "Apex generates a fresh wallet. You fund it from Phantom or anywhere else — "
-            "no keys to hunt for.\n\n"
-            "<b>🔐 Import a key</b>\n"
-            "Use a dedicated Phantom account's private key. Never your main wallet.\n\n"
+    text = (f"<b>👛 Connect your wallet</b>\n{RULE}\n"
+            "Apex trades from one Solana wallet that the bot signs for. Choose how to start:\n\n"
+            "<b>👻 Connect my Phantom</b>\n"
+            "Use a Phantom account you already have. Best: a <b>dedicated</b> account holding only "
+            "your trading funds, never your main one.\n\n"
+            "<b>✨ Create a new wallet</b>\n"
+            "Apex generates a fresh wallet. Fund it from Phantom or anywhere else.\n\n"
             "⚠️ Either way, the bot holds the key (AES-encrypted). Only fund what you can afford to lose.")
-    return text, _kb([[("✨ Create new wallet", "ax:wcreate")],
-                      [("🔐 Import a private key", "ax:wconnect")], HOME_BTN])
+    return text, _kb([[("👻 Connect my Phantom", "ax:wconnect")],
+                      [("✨ Create a new wallet", "ax:wcreate")], HOME_BTN])
 
 
 @router.callback_query(F.data == "ax:wallet")
@@ -2086,7 +2086,10 @@ async def cb_wallet(q: CallbackQuery):
 async def cb_wconnect(q: CallbackQuery):
     _await[q.from_user.id] = "wallet"
     await _send(q, "<b>🔐 Send your private key</b>\n" + RULE +
-                "\nPaste the base58 key from your dedicated Phantom account in your next message.",
+                "\nIn Phantom: tap the menu ☰ → your account → <b>Show Private Key</b> → "
+                "choose <b>Solana</b> → copy it.\n"
+                "(The recovery phrase won't work — it must be the private key.)\n\n"
+                "Paste it in your next message. I delete your message right away.",
                 _kb([[("Cancel", "ax:home")]]))
 
 
