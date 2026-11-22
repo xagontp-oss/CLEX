@@ -131,7 +131,8 @@ async def on_win(uid: int, profit_sol: float, name: str = ""):
                 await _update(uid, pending=pending)
                 return
             px = await apex.sol_usd()
-            reserve = int((apex.MIN_WALLET_USD / px) * 1e9) if px else 5_000_000
+            reserve = max(int((apex.MIN_WALLET_USD / px) * 1e9) if px else 5_000_000,
+                          int(apex.GAS_RESERVE_SOL * 1e9))          # the 0.15 SOL gas reserve is untouchable
             bal = int(round(await sn.get_sol_balance(w["pubkey"]) * 1e9))
             if bal - pending - apex.SEND_FEE_LAMPORTS < reserve:
                 await _update(uid, pending=pending)                  # keep gas for exits; try again next win

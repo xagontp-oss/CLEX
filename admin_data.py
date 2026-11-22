@@ -34,7 +34,8 @@ TABLES: Dict[str, Dict] = {
     "positions": {"title": "🎯 Trades", "table": "apex_positions", "order": "id DESC",
                   "cols": "id,user_id,mode,mint,name,symbol,status,profile,entry_ts,exit_ts,entry_sol,"
                           "realized_sol,entry_tokens,entry_price,entry_mcap,tokens_left,peak_ratio,"
-                          "last_ratio,exit_reason,buy_tx"},
+                          "last_ratio,exit_reason,buy_tx,buyers_30s_before_entry,curve_slope,"
+                          "dev_holding_pct,entry_rank_on_curve"},
     "settings": {"title": "⚙️ Settings", "table": "apex_settings", "order": "user_id",
                  "cols": "user_id,entry,profile,size_usd,size_sol,mode,paused,risk_ack"},
     "blacklist": {"title": "🚫 Blacklist", "table": "apex_blacklist", "order": "ts DESC",

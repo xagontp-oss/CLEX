@@ -94,6 +94,22 @@ SCALP_CHECKS = 2
 SCALP_SCORE_START, SCALP_SCORE_FLOOR, SCALP_SCORE_CAP = 0.30, 0.10, 0.70
 SCALP_FAST_INTERVAL = 6                # seconds between price checks on scalp positions
 SCALP_SESSION_LOSSES = 20              # circuit breaker: stop after 20 losing scalp trades in ONE session
+SCALP_ENTRY_SLIPPAGE_BPS = 800         # Rule 3: 8% (was 15%). A missed fill costs nothing
+SCALP_ACCEL_WINDOW = 30                # Rule 4: watch the curve for the 30s right before the fill
+SCALP_SLOPE_WINDOW = 10                # journal: curve price change over the last 10s before the fill
+PUMP_GRADUATION_SOL = 85.0             # SOL raised on the curve at graduation (100% of the curve)
+
+# Exit workers (Finding 1): one worker per position, supervised. No position can block another.
+WORKER_STEP_TIMEOUT = 100              # one check-and-act cycle may not take longer than this
+WORKER_STALL_SECS = 120                # no heartbeat for this long = the worker is dead
+SUPERVISOR_INTERVAL = 2                # how often the supervisor looks at every worker
+EXIT_FAILS_TO_EMERGENCY = 3            # a triggered exit that fails this many times in a row
+EMERGENCY_SLIPPAGE_BPS = 9900          # "any slippage": the most Jupiter accepts short of 100%
+EMERGENCY_ATTEMPTS = 3
+EMERGENCY_RETRY_SECS = 3
+
+# Rule 5: SOL kept untouchable for gas. No new position may take the wallet below this.
+GAS_RESERVE_SOL = 0.15
 
 # Execution
 ENTRY_SLIPPAGE_BPS = 1500          # 15%
@@ -145,13 +161,20 @@ PROFILES: Dict[str, Dict] = {
 }
 # The scalp exit is automatic for Apex Scalp (not shown in the exit menu).
 PROFILES["S"] = {"name": "Scalp", "icon": "🗡", "trail": True, "hidden": True,
-                 "tiers": [(1.15, 0.5), (1.35, 1.0)],
-                 "stop": 0.85, "trail_activate": 1.10, "trail_keep": 0.90,
-                 "time_stop_secs": 180, "time_stop_ratio": 1.05,
-                 "blurb": "Quick in-and-out.",
-                 "rows": ["+15% → sell half", "+35% → sell the rest",
-                          "−10% from the peak (once +10% up) → out", "−15% hard stop",
-                          "Flat for 3 minutes → out"]}
+                 # Rule 2: tier fractions are of the ORIGINAL position (40% then another 30%)
+                 "tiers": [(1.50, 0.40), (2.50, 0.30)], "tier_basis": "original",
+                 "stop": 0.90,                        # Rule 1: −10% flat, don't wait for −15%
+                 "verdict_secs": 90, "verdict_ratio": 1.08,   # Rule 1: the 90-second verdict
+                 "trail_keep": 0.65,                  # Rule 2: remainder trails 35% below its peak
+                 "time_stop_secs": None,              # Rule 2: no time limit on the runner
+                 "blurb": "90-second verdict, partials into strength, runner with no time limit.",
+                 "rows": ["−10% hard stop",
+                          "T+90s: not above +8% → sell at market",
+                          "Above +8% at T+90s → trailing stop engaged",
+                          "+50% → sell 40% of the position",
+                          "+150% → sell another 30%",
+                          "Remainder trails 35% below its peak, no time limit"]}
+VERDICT_BIT = 1 << 6                   # set in tiers_hit once a scalp position passes its 90s verdict
 SIZE_OPTIONS_USD = [5, 10, 25, 50, 100]
 
 # LP verification
@@ -179,11 +202,16 @@ def _jup_headers() -> Dict[str, str]:
     return {"x-api-key": JUP_KEY} if JUP_KEY else {}
 
 
-async def jup_quote(inp: str, out: str, amount: int, slippage_bps: int) -> Optional[Dict]:
+_jup_exit_sem = asyncio.Semaphore(8)   # exits get their own lane: screening can never starve them
+_jup_limited = {"n": 0, "logged": 0.0}
+
+
+async def jup_quote(inp: str, out: str, amount: int, slippage_bps: int,
+                    lane: str = "scan") -> Optional[Dict]:
     if amount <= 0:
         return None
     try:
-        async with _jup_sem:
+        async with (_jup_exit_sem if lane == "exit" else _jup_sem):
             async with aiohttp.ClientSession(headers=_jup_headers()) as s:
                 async with s.get(f"{JUP_BASE}/quote",
                                  params={"inputMint": inp, "outputMint": out,
@@ -192,6 +220,12 @@ async def jup_quote(inp: str, out: str, amount: int, slippage_bps: int) -> Optio
                                          "restrictIntermediateTokens": "true"},
                                  timeout=aiohttp.ClientTimeout(total=8)) as r:
                     if r.status != 200:
+                        if r.status == 429:
+                            _jup_limited["n"] += 1
+                            if time.time() - _jup_limited["logged"] > 60:
+                                _jup_limited["logged"] = time.time()
+                                logger.warning(f"Jupiter rate limit hit ({_jup_limited['n']} times so far) "
+                                               f"— lane={lane}")
                         return None
                     q = await r.json()
         if not isinstance(q, dict) or "error" in q or not q.get("outAmount"):
@@ -411,6 +445,14 @@ async def init_db():
             await db.commit()
         except Exception:
             pass                                    # column already exists
+        # Rule 6: the entry journal on every trade record
+        for col, typ in (("buyers_30s_before_entry", "INTEGER"), ("curve_slope", "REAL"),
+                         ("dev_holding_pct", "REAL"), ("entry_rank_on_curve", "REAL")):
+            try:
+                await db.execute(f"ALTER TABLE apex_positions ADD COLUMN {col} {typ}")
+                await db.commit()
+            except Exception:
+                pass                                # column already exists
         # One-time migration: paper mode is gone. Everyone starts STOPPED, in live mode.
         await db.execute("UPDATE apex_settings SET mode='live', paused=1 WHERE mode='paper'")
         await db.commit()
@@ -824,29 +866,54 @@ async def pump_final(pool: Pool) -> Verdict:
 def decide_exit(profile: str, ratio: float, tiers_hit: int, peak: float,
                 clock_start: float, now: float) -> Dict:
     """
-    Returns {"actions": [(kind, fraction_of_remaining, reason, tier_index)], "peak": x,
-             "clock_start": y}. kind is "partial" or "all".
+    Returns {"actions": [(kind, fraction, reason, tier_index)], "peak": x, "clock_start": y,
+             "flags": bits to OR into tiers_hit}. kind is "partial" or "all".
+    `fraction` is of the remaining bag, or of the ORIGINAL position when the profile has
+    tier_basis="original" (the caller converts it to a token amount).
+
+    Profiles with a 90-second verdict (Scalp) use clock_start as the entry time and never move it.
     """
     prof = PROFILES[profile]
     stop = prof.get("stop", HARD_STOP_RATIO)
-    trail_on = prof.get("trail_activate", TRAIL_ACTIVATE_RATIO)
     trail_keep = prof.get("trail_keep", TRAIL_KEEP)
-    ts_secs = prof.get("time_stop_secs", TIME_STOP_SECS)
-    ts_ratio = prof.get("time_stop_ratio", TIME_STOP_RATIO)
+    verdict_secs = prof.get("verdict_secs")
     peak = max(peak, ratio)
-    if ratio > ts_ratio:
-        clock_start = now
-    out = {"actions": [], "peak": peak, "clock_start": clock_start}
+    out = {"actions": [], "peak": peak, "clock_start": clock_start, "flags": 0}
 
-    if prof["trail"] and peak >= trail_on and ratio <= peak * trail_keep:
-        out["actions"].append(("all", 1.0, "trailing_stop", -1))
-        return out
-    if ratio <= stop:
-        out["actions"].append(("all", 1.0, "stop_loss", -1))
-        return out
-    if now - clock_start >= ts_secs and ratio <= ts_ratio:
-        out["actions"].append(("all", 1.0, "time_stop", -1))
-        return out
+    if verdict_secs:
+        # Trailing stop is engaged once the verdict is passed, or once the first partial has sold
+        # (from then on the position is a runner and the verdict no longer applies).
+        runner = bool(tiers_hit & 1)
+        engaged = bool(tiers_hit & VERDICT_BIT) or runner
+        if engaged and ratio <= peak * trail_keep:
+            out["actions"].append(("all", 1.0, "trailing_stop", -1))
+            return out
+        if ratio <= stop:
+            out["actions"].append(("all", 1.0, "stop_loss", -1))
+            return out
+        if not engaged and now - clock_start >= verdict_secs:
+            if ratio > prof["verdict_ratio"]:
+                out["flags"] |= VERDICT_BIT                      # impulse shown: normal flow continues
+            else:
+                out["actions"].append(("all", 1.0, "verdict_90s", -1))
+                return out
+    else:
+        trail_on = prof.get("trail_activate", TRAIL_ACTIVATE_RATIO)
+        ts_secs = prof.get("time_stop_secs", TIME_STOP_SECS)
+        ts_ratio = prof.get("time_stop_ratio", TIME_STOP_RATIO)
+        if ratio > ts_ratio:
+            clock_start = now
+            out["clock_start"] = now
+        if prof["trail"] and peak >= trail_on and ratio <= peak * trail_keep:
+            out["actions"].append(("all", 1.0, "trailing_stop", -1))
+            return out
+        if ratio <= stop:
+            out["actions"].append(("all", 1.0, "stop_loss", -1))
+            return out
+        if ts_secs and now - clock_start >= ts_secs and ratio <= ts_ratio:
+            out["actions"].append(("all", 1.0, "time_stop", -1))
+            return out
+
     for i, (thr, frac) in enumerate(prof["tiers"]):
         if tiers_hit & (1 << i) or ratio < thr:
             continue
@@ -854,7 +921,8 @@ def decide_exit(profile: str, ratio: float, tiers_hit: int, peak: float,
         if frac >= 1.0:
             out["actions"].append(("all", 1.0, "target", i))
         else:
-            out["actions"].append(("partial", frac, f"target_{int(round((thr - 1) * 100))}pct" if thr < 2 else f"target_{int(thr)}x", i))
+            out["actions"].append(("partial", frac, f"target_{int(round((thr - 1) * 100))}pct"
+                                   if thr < 2 else f"target_{thr:g}x", i))
         if last and frac >= 1.0:
             break
     return out
@@ -1006,14 +1074,15 @@ async def _notify_fail(uid: int, head: str, reason: str, sig: str = "", cost_not
                        f"{(chr(10) + cost_note) if cost_note else ''}{link}")
 
 
-async def _live_buy(uid: int, mint: str, sol: float, dec: int) -> Tuple[bool, float, str, str]:
+async def _live_buy(uid: int, mint: str, sol: float, dec: int,
+                    slippage_bps: int = ENTRY_SLIPPAGE_BPS) -> Tuple[bool, float, str, str]:
     w = await _wallet(uid)
     enc = await sn._get_enc_key(uid)
     if not w or not enc:
         return False, 0.0, "", "no wallet connected"
-    q = await jup_quote(WSOL, mint, int(sol * 1e9), ENTRY_SLIPPAGE_BPS)
+    q = await jup_quote(WSOL, mint, int(sol * 1e9), slippage_bps)
     if not q:
-        return False, 0.0, "", "no route within 15% slippage"
+        return False, 0.0, "", f"no route within {slippage_bps / 100:g}% slippage"
     raw = await jup_swap_tx(q, w["pubkey"])
     if not raw:
         return False, 0.0, "", "swap build failed"
@@ -1036,11 +1105,12 @@ async def _live_buy(uid: int, mint: str, sol: float, dec: int) -> Tuple[bool, fl
     return True, bal, sig, ""
 
 
-async def _sell(pos: Dict, tokens: float) -> Tuple[bool, float, str]:
+async def _sell(pos: Dict, tokens: float,
+                slippage_bps: int = EXIT_SLIPPAGE_BPS) -> Tuple[bool, float, str]:
     """Returns (ok, sol_out, tx). Paper sells simply realise the live quote."""
     dec = pos["decimals"]
     amount = int(tokens * 10 ** dec)
-    q = await jup_quote(pos["mint"], WSOL, amount, EXIT_SLIPPAGE_BPS)
+    q = await jup_quote(pos["mint"], WSOL, amount, slippage_bps, lane="exit")
     if not q:
         return False, 0.0, ""
     sol_out = int(q["outAmount"]) / 1e9
@@ -1062,8 +1132,13 @@ async def _sell(pos: Dict, tokens: float) -> Tuple[bool, float, str]:
     return True, sol_out, sig
 
 
-async def _enter_one(u: Dict, mint: str, name: str, symbol: str, dec: int, mcap: float):
+JOURNAL_FIELDS = ("buyers_30s_before_entry", "curve_slope", "dev_holding_pct", "entry_rank_on_curve")
+
+
+async def _enter_one(u: Dict, mint: str, name: str, symbol: str, dec: int, mcap: float,
+                     journal: Optional[Dict] = None, buyers_task: Optional["asyncio.Task"] = None):
     uid = u["user_id"]
+    journal = journal or {}
     try:
         if _halted["on"]:
             return
@@ -1082,19 +1157,18 @@ async def _enter_one(u: Dict, mint: str, name: str, symbol: str, dec: int, mcap:
         if not w:
             return
         bal = await sn.get_sol_balance(w["pubkey"])
-        if bal * px < MIN_WALLET_USD:
+        # Rule 5: available SOL minus this position minus the 0.15 SOL gas reserve must not go negative
+        if bal - sol - GAS_RESERVE_SOL < 0:
             if time.time() - u["low_alert"] > 3600:
                 await set_setting(uid, low_alert=time.time())
-                await _notify(uid, "⚠️ <b>Wallet running low</b>\n"
-                                   f"Balance is {bal:.4f} SOL — below the ${MIN_WALLET_USD:.0f} "
-                                   "reserve. New entries are paused so exits can still pay gas.")
+                await _notify(uid, "⚠️ <b>Gas reserve protected — entries paused</b>\n"
+                                   f"Balance <b>{bal:.4f} SOL</b>. A trade needs <b>{sol:.4f} SOL</b> plus "
+                                   f"the <b>{GAS_RESERVE_SOL:g} SOL</b> that is always kept for exits "
+                                   f"(≈ {sol + GAS_RESERVE_SOL:.4f} SOL). Open positions are still managed. "
+                                   "Top up the wallet to keep sniping.")
             return
-        if bal < sol + 0.004:
-            await _notify_fail(uid, f"Buy skipped — {name}",
-                               f"wallet has {bal:.4f} SOL, a trade needs about {sol + 0.004:.4f}",
-                               cost_note="Top up the wallet to keep sniping.")
-            return
-        ok, tokens, sig, err = await _live_buy(uid, mint, sol, dec)
+        slip = SCALP_ENTRY_SLIPPAGE_BPS if profile == "S" else ENTRY_SLIPPAGE_BPS
+        ok, tokens, sig, err = await _live_buy(uid, mint, sol, dec, slippage_bps=slip)
         if not ok:
             logger.warning(f"live buy failed {mint[:8]}: {err}")
             await _notify_fail(
@@ -1107,16 +1181,27 @@ async def _enter_one(u: Dict, mint: str, name: str, symbol: str, dec: int, mcap:
         entry_price = sol / tokens
         now = time.time()
         async with aiosqlite.connect(DB_PATH, timeout=10) as db:
-            await db.execute(
+            cur = await db.execute(
                 "INSERT INTO apex_positions(user_id,mode,mint,name,symbol,entry_ts,entry_sol,"
                 "entry_tokens,entry_price,entry_mcap,decimals,tokens_left,profile,peak_ratio,"
-                "clock_start,buy_tx) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "clock_start,buy_tx,curve_slope,dev_holding_pct,entry_rank_on_curve) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (uid, mode, mint, name, symbol, now, sol, tokens, entry_price, mcap, dec,
-                 tokens, profile, 1.0, now, sig))
+                 tokens, profile, 1.0, now, sig, journal.get("curve_slope"),
+                 journal.get("dev_holding_pct"), journal.get("entry_rank_on_curve")))
+            pid = cur.lastrowid
             await db.commit()
+        if buyers_task is not None:
+            _spawn(_attach_buyers(pid, buyers_task))
         _stats["entries"] += 1
         prof = PROFILES[profile]
         tag = "🔴 LIVE"
+        if profile == "S":
+            plan = ("Stop       <code>-10%</code> hard · 90s verdict: above <code>+8%</code> or out\n"
+                    "Partials   40% at <code>+50%</code> · 30% at <code>+150%</code> · rest trails 35%\n")
+        else:
+            plan = (f"Stop       <code>-{(1 - prof.get('stop', HARD_STOP_RATIO)) * 100:.0f}%</code> hard · "
+                    f"trailing after +{(prof.get('trail_activate', TRAIL_ACTIVATE_RATIO) - 1) * 100:.0f}%\n")
         await _notify(uid, (
             f"🎯 <b>Position opened</b>  ·  {tag}\n"
             f"━━━━━━━━━━━━━━━\n"
@@ -1126,8 +1211,7 @@ async def _enter_one(u: Dict, mint: str, name: str, symbol: str, dec: int, mcap:
             f"Size       <code>{sol:.4f} SOL</code> (≈ ${sol * px:,.2f})\n"
             f"Mkt cap    <code>${mcap:,.0f}</code>\n"
             f"Exit plan  {prof['icon']} {prof['name']}\n"
-            f"Stop       <code>-{(1 - prof.get('stop', HARD_STOP_RATIO)) * 100:.0f}%</code> hard · "
-            f"trailing after +{(prof.get('trail_activate', TRAIL_ACTIVATE_RATIO) - 1) * 100:.0f}%\n\n"
+            f"{plan}\n"
             f"<a href=\"https://dexscreener.com/solana/{mint}\">Chart</a> · "
             f"<a href=\"https://solscan.io/token/{mint}\">Solscan</a>"))
     except Exception as e:
@@ -1135,8 +1219,8 @@ async def _enter_one(u: Dict, mint: str, name: str, symbol: str, dec: int, mcap:
 
 
 async def _close_or_reduce(pos: Dict, tokens: float, reason: str, tier: int,
-                           full: bool) -> bool:
-    ok, sol_out, tx = await _sell(pos, tokens)
+                           full: bool, slippage_bps: int = EXIT_SLIPPAGE_BPS) -> bool:
+    ok, sol_out, tx = await _sell(pos, tokens, slippage_bps)
     if not ok:
         return False
     left = 0.0 if full else max(0.0, pos["tokens_left"] - tokens)
@@ -1156,6 +1240,10 @@ async def _close_or_reduce(pos: Dict, tokens: float, reason: str, tier: int,
             head = "🪂 <b>Trailing stop — profit secured</b>"
         elif reason == "time_stop":
             head = "⏳ <b>Time-stop — capital freed</b>"
+        elif reason == "verdict_90s":
+            head = "⏱ <b>90-second verdict — no impulse, out</b>"
+        elif reason == "emergency_sell":
+            head = "🚨 <b>Emergency exit</b>"
         else:
             head = "✅ <b>Position closed — target hit</b>"
         sign = "+" if pnl >= 0 else ""
@@ -1218,7 +1306,7 @@ async def _manage(pos: Dict):
         if tokens <= 0:
             return
         q = await jup_quote(pos["mint"], WSOL, int(tokens * 10 ** pos["decimals"]),
-                            EXIT_SLIPPAGE_BPS)
+                            EXIT_SLIPPAGE_BPS, lane="exit")
         if not q:
             fails = pos["fails"] + 1
             if fails >= (50 if pos["profile"] == "S" else DEAD_AFTER_FAILS):
@@ -1235,44 +1323,197 @@ async def _manage(pos: Dict):
         ratio = (value / tokens) / pos["entry_price"] if pos["entry_price"] else 1.0
         d = decide_exit(pos["profile"], ratio, pos["tiers_hit"], pos["peak_ratio"],
                         pos["clock_start"], time.time())
+        hit = pos["tiers_hit"] | d.get("flags", 0)
         await _update_pos(pos["id"], peak_ratio=d["peak"], clock_start=d["clock_start"],
-                          last_ratio=ratio, fails=0)
-        cur = dict(pos, tokens_left=tokens)
+                          last_ratio=ratio, fails=0, tiers_hit=hit)
+        cur = dict(pos, tokens_left=tokens, tiers_hit=hit)
+        of_original = PROFILES[pos["profile"]].get("tier_basis") == "original"
         for kind, frac, reason, tier in d["actions"]:
-            amt = tokens if kind == "all" else cur["tokens_left"] * frac
-            if not await _close_or_reduce(cur, amt, reason, tier, kind == "all"):
+            if kind == "all":
+                amt = cur["tokens_left"]
+            elif of_original:
+                amt = min(cur["tokens_left"], pos["entry_tokens"] * frac)
+            else:
+                amt = cur["tokens_left"] * frac
+            full = kind == "all" or amt >= cur["tokens_left"] * 0.999
+            if not await _close_or_reduce(cur, amt, reason, tier, full):
+                fails = _exit_fails.get(pos["id"], 0) + 1 if full else 0
+                _exit_fails[pos["id"]] = fails
+                if full and fails >= EXIT_FAILS_TO_EMERGENCY:
+                    _exit_fails.pop(pos["id"], None)
+                    raise ExitFailed(reason)          # the worker escalates to an emergency sell
                 if time.time() - _exit_warned.get(pos["id"], 0) > 300:
                     _exit_warned[pos["id"]] = time.time()
                     await _notify(pos["user_id"],
                                   f"⚠️ <b>Exit didn't go through</b> — "
                                   f"{html.escape(pos['name'] or pos['mint'][:6])}\n"
                                   f"Trigger: <code>{reason}</code>. The sell failed (usually slippage "
-                                  "or a congested network). Apex is retrying every 30 seconds.")
+                                  "or a congested network). Apex retries on the next check"
+                                  + (f"; after {EXIT_FAILS_TO_EMERGENCY} failed tries it sells at "
+                                     "any slippage." if full else "."))
                 break
-            cur = (await positions(pos["user_id"], "open", 100) or [None])
-            cur = next((p for p in cur if p and p["id"] == pos["id"]), None)
-            if not cur:
+            _exit_fails.pop(pos["id"], None)
+            cur = await get_position(pos["id"])
+            if not cur or cur["status"] != "open":
                 break
 
 
-_last_manage: Dict[int, float] = {}
+# ══════════════════════════════════════════════════════════════════════════════
+# EXIT WORKERS — one async worker per open position, watched by a supervisor.
+# A worker that dies (crashes, hangs, or can't get a triggered exit through) hands its position
+# to an emergency market sell at any slippage. No position can block another.
+# ══════════════════════════════════════════════════════════════════════════════
+class ExitFailed(Exception):
+    """A triggered full exit failed EXIT_FAILS_TO_EMERGENCY times in a row."""
+
+
+_exit_fails: Dict[int, int] = {}
+_workers: Dict[int, asyncio.Task] = {}
+_beats: Dict[int, float] = {}
+_emergency: Dict[int, asyncio.Task] = {}
+
+
+async def get_position(pid: int) -> Optional[Dict]:
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT * FROM apex_positions WHERE id=?", (pid,))
+        row = await cur.fetchone()
+        return dict(row) if row else None
+
+
+async def _token_balance_strict(pubkey: str, mint: str) -> Optional[float]:
+    """The wallet's real token balance, or None if the RPC couldn't say (never a guessed 0)."""
+    res = await _h("getTokenAccountsByOwner", [pubkey, {"mint": mint}, {"encoding": "jsonParsed"}])
+    if res is None or "value" not in res:
+        return None
+    try:
+        return sum(float(a["account"]["data"]["parsed"]["info"]["tokenAmount"]["uiAmount"] or 0)
+                   for a in res["value"])
+    except Exception:
+        return None
+
+
+def _interval(pos: Dict) -> float:
+    return SCALP_FAST_INTERVAL if pos["profile"] == "S" else MONITOR_INTERVAL
+
+
+async def _position_worker(pid: int):
+    """Checks one position on its own clock until it closes. Each step has a hard timeout."""
+    while True:
+        _beats[pid] = time.time()
+        pos = await get_position(pid)
+        if not pos or pos["status"] != "open" or pos["tokens_left"] <= 0:
+            return
+        await asyncio.wait_for(_manage(pos), timeout=WORKER_STEP_TIMEOUT)
+        _beats[pid] = time.time()
+        await asyncio.sleep(_interval(pos))
+
+
+async def _emergency_sell(pid: int, why: str) -> bool:
+    """Sell everything still held, at any slippage. Uses the wallet's real balance, so a sell that
+    landed after its worker died is never repeated."""
+    pos = await get_position(pid)
+    if not pos or pos["status"] != "open" or pos["tokens_left"] <= 0:
+        return True
+    lock = _pos_locks.setdefault(pid, asyncio.Lock())
+    try:
+        await asyncio.wait_for(lock.acquire(), timeout=15)
+        held = True
+    except asyncio.TimeoutError:
+        held = False                                   # a hung step still holds it: go anyway
+    try:
+        pos = await get_position(pid)
+        if not pos or pos["status"] != "open" or pos["tokens_left"] <= 0:
+            return True
+        name = html.escape(pos["name"] or pos["mint"][:6])
+        tokens = pos["tokens_left"]
+        if pos["mode"] == "live":
+            w = await _wallet(pos["user_id"])
+            bal = await _token_balance_strict(w["pubkey"], pos["mint"]) if w else None
+            if bal is not None and bal <= 0:
+                await _update_pos(pid, status="closed", tokens_left=0, exit_ts=time.time(),
+                                  exit_reason="emergency_sell")
+                logger.warning(f"emergency {pid}: wallet already holds no {pos['mint'][:8]} — closed")
+                return True
+            if bal is not None:
+                tokens = min(tokens, bal)
+        for attempt in range(1, EMERGENCY_ATTEMPTS + 1):
+            if await _close_or_reduce(pos, tokens, "emergency_sell", -1, True, EMERGENCY_SLIPPAGE_BPS):
+                logger.warning(f"emergency sell {pid} {pos['mint'][:8]} done ({why}, attempt {attempt})")
+                return True
+            if attempt < EMERGENCY_ATTEMPTS:
+                await asyncio.sleep(EMERGENCY_RETRY_SECS)
+        logger.error(f"emergency sell {pid} {pos['mint'][:8]} failed {EMERGENCY_ATTEMPTS}x ({why})")
+        await _notify(pos["user_id"],
+                      f"🚨 <b>Emergency exit failed</b> — {name}\n"
+                      f"Trigger: <code>{html.escape(why)}</code>. No sell went through at any slippage. "
+                      "Apex keeps watching this position and will try again.")
+        return False
+    finally:
+        if held:
+            lock.release()
+
+
+async def _run_emergency(pid: int, why: str):
+    try:
+        await _emergency_sell(pid, why)
+    except Exception as e:
+        logger.error(f"emergency {pid}: {e}", exc_info=True)
+
+
+def _worker_died(pid: int, task: asyncio.Task) -> Optional[str]:
+    """Why a finished worker ended badly, or None if it finished normally."""
+    if task.cancelled():
+        return "worker cancelled"
+    exc = task.exception()
+    if exc is None:
+        return None
+    if isinstance(exc, ExitFailed):
+        return f"exit {exc} failed {EXIT_FAILS_TO_EMERGENCY}x"
+    if isinstance(exc, asyncio.TimeoutError):
+        return f"check took over {WORKER_STEP_TIMEOUT}s"
+    return f"worker crashed: {type(exc).__name__}: {exc}"
+
+
+async def supervise_once(now: Optional[float] = None):
+    """One supervisor pass: start missing workers, and hand dead or stalled ones to an emergency sell."""
+    now = now or time.time()
+    open_ids = {p["id"] for p in await positions(None, "open", 1000)}
+    for pid in list(_workers):
+        t = _workers[pid]
+        if pid not in open_ids:
+            if not t.done():
+                t.cancel()
+            _workers.pop(pid, None)
+            _beats.pop(pid, None)
+            continue
+        why = None
+        if t.done():
+            why = _worker_died(pid, t)
+        elif now - _beats.get(pid, now) > WORKER_STALL_SECS:
+            t.cancel()
+            why = f"no heartbeat for {int(now - _beats[pid])}s"
+        if t.done() or why:
+            _workers.pop(pid, None)
+            _beats.pop(pid, None)
+            if why and not (pid in _emergency and not _emergency[pid].done()):
+                logger.error(f"exit worker {pid} died — {why}; emergency sell")
+                _emergency[pid] = asyncio.create_task(_run_emergency(pid, why))
+    for pid in open_ids:
+        if pid in _workers or (pid in _emergency and not _emergency[pid].done()):
+            continue
+        _beats[pid] = now
+        _workers[pid] = asyncio.create_task(_position_worker(pid))
 
 
 async def monitor_loop():
-    logger.info("Apex position monitor started")
+    logger.info("Apex exit supervisor started (one worker per open position)")
     while True:
         try:
-            ps = await positions(None, "open", 500)
-            now = time.time()
-            due = [p for p in ps if p["profile"] == "S"
-                   or now - _last_manage.get(p["id"], 0) >= MONITOR_INTERVAL]
-            for p in due:
-                _last_manage[p["id"]] = now
-            if due:
-                await asyncio.gather(*[_manage(p) for p in due], return_exceptions=True)
+            await supervise_once()
         except Exception as e:
-            logger.error(f"monitor: {e}", exc_info=True)
-        await asyncio.sleep(SCALP_FAST_INTERVAL)
+            logger.error(f"supervisor: {e}", exc_info=True)
+        await asyncio.sleep(SUPERVISOR_INTERVAL)
 
 
 async def housekeeping_loop():
@@ -1508,7 +1749,117 @@ def scalp_evaluate(pool: Pool, holders, amounts, real_sol: float, age_s: float,
     return True, "", sc
 
 
-async def _finish_entry(pool: Pool, dec: int, mcap: float, entry: str = "apex"):
+_bg_tasks: set = set()
+
+
+def _spawn(coro) -> "asyncio.Task":
+    """create_task that keeps a strong reference until the task finishes (asyncio only keeps a
+    weak one, so a long-waiting task could otherwise be garbage-collected mid-flight)."""
+    t = asyncio.create_task(coro)
+    _bg_tasks.add(t)
+    t.add_done_callback(_bg_tasks.discard)
+    return t
+
+
+def curve_price_ratio(sol_a: float, sol_b: float) -> float:
+    """Bonding-curve price at b relative to a, from SOL raised. Price = vSOL / vTokens and
+    vTokens = K / vSOL, so price = vSOL² / K."""
+    va, vb = PUMP_START_SOL + sol_a, PUMP_START_SOL + sol_b
+    return (vb / va) ** 2 if va > 0 else 1.0
+
+
+async def _curve_read(pool: Pool, curve_owner: str) -> Optional[Tuple[float, float, list]]:
+    """(timestamp, SOL raised, holders) for a pump.fun coin, or None if unreadable."""
+    async with _pipeline_sem:
+        hv = await _holder_view(pool.mint, PUMP_SUPPLY, curve_owner)
+    if hv is None:
+        return None
+    holders, curve_ui, _ = hv
+    return time.time(), pump_real_sol(curve_ui), holders
+
+
+async def scalp_acceleration_gate(pool: Pool, curve_owner: str, sol0: float, t0: float,
+                                  prev_sol: Optional[float], prev_t: Optional[float]
+                                  ) -> Tuple[bool, str, Dict]:
+    """
+    Rule 4: enter only if the bonding curve shows UPWARD ACCELERATION in the 30 seconds right
+    before the fill. Readings at t0 (the passing check), t0+20 and t0+30.
+        recent speed  = SOL added in the 30s window / 30s
+        prior speed   = SOL added between the previous check and t0 (or since launch)
+        pass          = recent speed > 0 and recent speed > prior speed
+    Also returns the journal fields measured at the fill: curve_slope (% price change over the
+    last 10s), dev_holding_pct, entry_rank_on_curve (% of the way to graduation), and
+    price_move (curve price at the fill vs t0, used to update the market cap).
+    """
+    await asyncio.sleep(max(0.0, t0 + SCALP_ACCEL_WINDOW - SCALP_SLOPE_WINDOW - time.time()))
+    r20 = await _curve_read(pool, curve_owner)
+    await asyncio.sleep(max(0.0, t0 + SCALP_ACCEL_WINDOW - time.time()))
+    r30 = await _curve_read(pool, curve_owner)
+    if r20 is None or r30 is None:
+        return False, "accel_unreadable", {}
+    t20, sol20, _ = r20
+    t30, sol30, holders = r30
+    recent = (sol30 - sol0) / max(t30 - t0, 1.0)
+    if prev_sol is not None and prev_t is not None and t0 - prev_t > 0:
+        prior = (sol0 - prev_sol) / (t0 - prev_t)
+    else:
+        prior = sol0 / max(t0 - pool.ts, 1.0)
+    if recent <= 0:
+        return False, "accel_flat", {}
+    if recent <= prior:
+        return False, "accel_slowing", {}
+    return True, "", {
+        "curve_slope": (curve_price_ratio(sol20, sol30) - 1.0) * 100.0,
+        "dev_holding_pct": next((p for o, p in holders if o == pool.dev), 0.0),
+        "entry_rank_on_curve": min(100.0, sol30 / PUMP_GRADUATION_SOL * 100.0),
+        "price_move": curve_price_ratio(sol0, sol30),
+    }
+
+
+async def _buyers_before(mint: str, curve_addr: str, t_end: float,
+                         window: float = SCALP_ACCEL_WINDOW) -> Optional[int]:
+    """Journal: unique wallets that BOUGHT on the bonding curve in the `window` seconds before
+    t_end. A buyer is a fee payer whose balance of this token went up in that transaction."""
+    sigs = await _h("getSignaturesForAddress", [curve_addr, {"limit": 100, "commitment": "confirmed"}])
+    if sigs is None:
+        return None
+    win = [s["signature"] for s in sigs
+           if not s.get("err") and s.get("blockTime") and t_end - window <= s["blockTime"] < t_end][:60]
+    txs = await asyncio.gather(*[_h("getTransaction", [sig, {"encoding": "jsonParsed", "commitment": "confirmed",
+                                                             "maxSupportedTransactionVersion": 0}])
+                                 for sig in win])
+    buyers = set()
+    for tx in txs:
+        try:
+            keys = tx["transaction"]["message"]["accountKeys"]
+            payer = keys[0]["pubkey"] if isinstance(keys[0], dict) else keys[0]
+            meta = tx.get("meta") or {}
+
+            def held(side: str) -> float:
+                return sum(float(b["uiTokenAmount"]["uiAmount"] or 0) for b in meta.get(side) or []
+                           if b.get("mint") == mint and b.get("owner") == payer)
+
+            if held("postTokenBalances") > held("preTokenBalances"):
+                buyers.add(payer)
+        except Exception:
+            continue
+    return len(buyers)
+
+
+async def _attach_buyers(pid: int, task: "asyncio.Task"):
+    try:
+        n = await task
+    except Exception:
+        n = None
+    if n is not None:
+        await _update_pos(pid, buyers_30s_before_entry=n)
+
+
+async def _finish_entry(pool: Pool, dec: int, mcap: float, entry: str = "apex",
+                        journal: Optional[Dict] = None):
+    t_decide = time.time()
+    buyers_task = (_spawn(_buyers_before(pool.mint, curve_pda(pool.mint), t_decide))
+                   if pool.kind == "pump" else None)
     meta = await _das("getAsset", {"id": pool.mint}) or {}
     md = (meta.get("content") or {}).get("metadata") or {}
     name = md.get("name") or pool.mint[:6]
@@ -1519,8 +1870,9 @@ async def _finish_entry(pool: Pool, dec: int, mcap: float, entry: str = "apex"):
         _scalp["signals"].append(time.time())
     for u in await _active_users():
         if u.get("entry", "apex") == entry:
-            asyncio.create_task(_enter_one(u, pool.mint, name, symbol, dec, mcap))
-    logger.info(f"APEX PASS [{entry}/{pool.kind}] {name} ({pool.mint[:8]}) mcap=${mcap:,.0f}")
+            _spawn(_enter_one(u, pool.mint, name, symbol, dec, mcap, journal, buyers_task))
+    logger.info(f"APEX PASS [{entry}/{pool.kind}] {name} ({pool.mint[:8]}) mcap=${mcap:,.0f}"
+                + (f" journal={ {k: round(v, 2) for k, v in journal.items()} }" if journal else ""))
 
 
 async def pump_pipeline(pool: Pool):
@@ -1550,6 +1902,7 @@ async def pump_pipeline(pool: Pool):
     _pump_watchers += 1
     first_pass = True
     prev_sol: Optional[float] = None
+    prev_t: Optional[float] = None
     final: Optional[Verdict] = None
     curve_owner = curve_pda(pool.mint)
     try:
@@ -1572,9 +1925,12 @@ async def pump_pipeline(pool: Pool):
                     _count_reject("holders_unreadable")
                 continue
             holders, curve_ui, amounts = hv
+            t_read = time.time()
             px = await sol_usd()
             real_sol = pump_real_sol(curve_ui)
-            age_s = max(1.0, time.time() - pool.ts)
+            age_s = max(1.0, t_read - pool.ts)
+            journal_now = {"dev_holding_pct": next((p for o, p in holders if o == pool.dev), 0.0),
+                           "entry_rank_on_curve": min(100.0, real_sol / PUMP_GRADUATION_SOL * 100.0)}
             dex = await dex_metrics(pool.mint) if (want_flow or want_scalp) else None
 
             # ---------------- SCALP
@@ -1587,8 +1943,11 @@ async def pump_pipeline(pool: Pool):
                         async with _pipeline_sem:
                             final = await pump_final(pool)
                     if final.ok:
-                        _stats["scalp_signals"] = _stats.get("scalp_signals", 0) + 1
-                        await _finish_entry(pool, final.data["decimals"], final.data["mcap"], "scalp")
+                        # Rule 4 watches the curve for 30s before the fill; run it on its own so
+                        # the other strategies' checks on this coin aren't held up.
+                        _spawn(_scalp_confirm_and_enter(
+                            pool, curve_owner, final.data["decimals"], final.data["mcap"],
+                            real_sol, t_read, prev_sol, prev_t))
                     else:
                         _count_reject("scalp_" + final.reason)
                         if final.permanent:
@@ -1608,7 +1967,8 @@ async def pump_pipeline(pool: Pool):
                             final = await pump_final(pool)
                     if final.ok:
                         _stats["flow_signals"] = _stats.get("flow_signals", 0) + 1
-                        await _finish_entry(pool, final.data["decimals"], final.data["mcap"], "flow")
+                        await _finish_entry(pool, final.data["decimals"], final.data["mcap"], "flow",
+                                            journal_now)
                     else:
                         _count_reject("flow_" + final.reason)
                         if final.permanent:
@@ -1648,7 +2008,8 @@ async def pump_pipeline(pool: Pool):
                                 final = await pump_final(pool)
                         if final.ok:
                             _stats["confirmed"] += 1
-                            await _finish_entry(pool, final.data["decimals"], final.data["mcap"], "apex")
+                            await _finish_entry(pool, final.data["decimals"], final.data["mcap"], "apex",
+                                                journal_now)
                         else:
                             _count_reject(final.reason)
                             if final.permanent:
@@ -1658,11 +2019,28 @@ async def pump_pipeline(pool: Pool):
                         _count_reject("liquidity_low")
                         want_apex = False
 
-            prev_sol = real_sol
+            prev_sol, prev_t = real_sol, t_read
             if not (want_apex or want_flow or want_scalp):
                 return
     finally:
         _pump_watchers -= 1
+
+
+async def _scalp_confirm_and_enter(pool: Pool, curve_owner: str, dec: int, mcap: float,
+                                   sol0: float, t0: float, prev_sol: Optional[float],
+                                   prev_t: Optional[float]):
+    try:
+        ok, why, j = await scalp_acceleration_gate(pool, curve_owner, sol0, t0, prev_sol, prev_t)
+        if not ok:
+            _count_reject("scalp_" + why)
+            return
+        if not await _budget_ok() or not any(u.get("entry") == "scalp" for u in await _active_users()):
+            return
+        _stats["scalp_signals"] = _stats.get("scalp_signals", 0) + 1
+        journal = {k: j[k] for k in ("curve_slope", "dev_holding_pct", "entry_rank_on_curve")}
+        await _finish_entry(pool, dec, mcap * j["price_move"], "scalp", journal)
+    except Exception as e:
+        logger.error(f"scalp confirm {pool.mint[:8]}: {e}", exc_info=True)
 
 
 async def on_pool_event(tx: Dict):
@@ -1824,9 +2202,10 @@ ENTRIES = {
              "blurb": "Looser, faster. Aims for ~20 entries an hour and picks the strongest "
                       "momentum, filtering out bundled launches, dumping devs and whales."},
     "scalp": {"icon": "🗡", "name": "Apex Scalp",
-              "blurb": "Loosest gates, one test: is it moving right now? Aims for ~50 quick "
-                       "in-and-out trades an hour with its own tight exit (own stop, trailing "
-                       "stop, 3-minute time-out). A circuit breaker stops it after a bad streak."},
+              "blurb": "Loose gates, then the curve must be accelerating in the 30s before the buy. "
+                       "−10% stop, a 90-second verdict (above +8% or out), 40% sold at +50%, "
+                       "30% at +150%, and a runner that trails 35% below its peak with no time "
+                       "limit. A circuit breaker stops it after a bad streak."},
 }
 
 
@@ -1962,11 +2341,12 @@ async def _do_start(uid: int, target):
     px = await sol_usd()
     bal = await sn.get_sol_balance(w["pubkey"])
     size_sol = s["size_sol"] or ((s["size_usd"] / px) if px else 0)
-    need = size_sol + 0.004 + (MIN_WALLET_USD / px if px else 0)
+    need = size_sol + 0.004 + GAS_RESERVE_SOL
     if bal < need:
         await _send(target, f"<b>💸 Fund your wallet first</b>\n{RULE}\n"
                             f"Balance <b>{bal:.4f} SOL</b> · needed about <b>{need:.4f} SOL</b>\n"
-                            "(one trade + fees + the $4 gas reserve).\n\n"
+                            f"(one trade + fees + the {GAS_RESERVE_SOL:g} SOL gas reserve, which is never "
+                            "spent on trades).\n\n"
                             f"Send SOL to:\n<code>{w['pubkey']}</code>",
                     _kb([[("↻ Check again", "ax:start")], HOME_BTN]))
         return
@@ -2551,8 +2931,9 @@ async def cb_how(q: CallbackQuery):
         "<b>3 · Enter</b> — your fixed size, never more, via Jupiter.\n\n"
         "<b>4 · Manage</b> — your exit profile, a −45% hard stop, a 25% trailing stop "
         "after +100%, and a 72-hour time-stop.\n\n"
-        "<b>🗡 Scalp mode</b> takes almost anything that is moving, then gets out fast: +15% sells half, "
-        "+35% the rest, −10% from the peak or −15% from entry exits, 3 flat minutes exits. "
+        "<b>🗡 Scalp mode</b> takes coins that are moving and whose curve is accelerating in the 30s "
+        "before the buy. −10% hard stop; at 90 seconds it must be above +8% or it's sold; 40% sells "
+        "at +50%, another 30% at +150%, and the rest trails 35% below its peak with no time limit. "
         "A circuit breaker stops it after a bad streak.\n\n"
         "<b>🌊 Flow mode</b> trades the same safety basics but scores momentum — buy pressure, "
         "curve speed, holder spread — and drops bundled launches and dumping devs. It tunes "
