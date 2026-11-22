@@ -1244,10 +1244,12 @@ async def housekeeping_loop():
             if not await _budget_ok() and not _halted["credit_alerted"]:
                 _halted["credit_alerted"] = True
                 for u in users:
-                    await _notify(u["user_id"],
-                                  "🧮 <b>Credit guard engaged</b>\nApex has used ~95% of this "
-                                  "month's Helius credit ceiling. Screening is paused to protect "
-                                  "your budget; exits keep running.")
+                    msg = ("🧮 <b>Credit guard engaged</b>\nApex has used ~95% of this "
+                           "month's Helius credit ceiling. Screening is paused to protect "
+                           "your budget; exits keep running.") if can_export(u["user_id"]) else (
+                           "⏸ <b>Screening paused</b>\nNew entries are paused for now. "
+                           "Open positions are still protected and exits keep running.")
+                    await _notify(u["user_id"], msg)
         except Exception as e:
             logger.error(f"housekeeping: {e}")
 
@@ -2345,8 +2347,9 @@ async def send_sol(uid: int, dest: str, lamports: int) -> Tuple[bool, str, str]:
         return False, "", "unexpected error"
 
 
-async def _status_page() -> Tuple[str, InlineKeyboardMarkup]:
-    today, month = await credits_used()
+async def _status_page(uid: int = 0) -> Tuple[str, InlineKeyboardMarkup]:
+    owner = can_export(uid)
+    today, month = await credits_used() if owner else (0, 0)
     px = await sol_usd()
     reasons = sorted(_reject_reasons.items(), key=lambda x: -x[1])[:5]
     rtxt = "\n".join(f"  • {k.replace('_', ' ')} — {v}" for k, v in reasons) or "  • nothing yet"
@@ -2367,22 +2370,22 @@ async def _status_page() -> Tuple[str, InlineKeyboardMarkup]:
             f"Signals (last hour)  <code>{len([t for t in _scalp['signals'] if time.time() - t < 3600])}</code>"
             f" / target <code>{SCALP_TARGET_PER_HOUR}</code>\n"
             f"Score threshold      <code>{_scalp['min_score']:.2f}</code> <i>(self-tunes)</i>\n\n"
-            f"<b>Top rejections</b>\n{rtxt}\n\n"
-            f"<b>Helius credits (est.)</b>\n"
-            f"Today <code>{today:,}</code> · Month <code>{month:,}</code> / "
-            f"<code>{MONTHLY_CREDIT_CEILING:,}</code>")
+            f"<b>Top rejections</b>\n{rtxt}"
+            + (f"\n\n<b>Helius credits (est.)</b>\n"
+               f"Today <code>{today:,}</code> · Month <code>{month:,}</code> / "
+               f"<code>{MONTHLY_CREDIT_CEILING:,}</code>" if owner else ""))
     return text, _kb([[("↻ Refresh", "ax:stat")], HOME_BTN])
 
 
 @router.callback_query(F.data == "ax:stat")
 async def cb_stat(q: CallbackQuery):
-    t, kb = await _status_page()
+    t, kb = await _status_page(q.from_user.id)
     await _send(q, t, kb)
 
 
 @router.message(Command("status"))
 async def cmd_status(m: Message):
-    t, kb = await _status_page()
+    t, kb = await _status_page(m.from_user.id)
     await _send(m, t, kb)
 
 
@@ -2444,7 +2447,7 @@ async def cmd_help(m: Message):
     await _send(m, (
         f"<b>Commands</b>\n{RULE}\n/start — home\n/positions — what's open\n"
         "/history — last 20 trades\n/settings — exit strategy\n/run — start sniping · /stop — stop sniping\n"
-        "/balance — wallet\n/status — engine &amp; credits\n/blacklist — banned tokens"),
+        "/balance — wallet\n/status — engine status\n/blacklist — banned tokens"),
         _kb([HOME_BTN]))
 
 
@@ -2523,7 +2526,7 @@ async def on_text(m: Message):
 BOT_COMMANDS = [
     ("start", "Open Apex"), ("positions", "Open positions"), ("history", "Last 20 trades"),
     ("settings", "Exit strategy"), ("run", "▶ Start sniping"), ("stop", "■ Stop sniping"),
-    ("balance", "Wallet balance"), ("status", "Engine & credit status"),
+    ("balance", "Wallet balance"), ("status", "Engine status"),
     ("blacklist", "Banned tokens"), ("help", "All commands"),
 ]
 
