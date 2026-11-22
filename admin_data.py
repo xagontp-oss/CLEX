@@ -80,7 +80,6 @@ async def cb_data(q: CallbackQuery):
             + "\n".join(f"{v['title']}  <code>{counts[k]}</code>" for k, v in TABLES.items())
             + "\n\n<i>Wallet keys are never shown — only their addresses.</i>")
     rows = [[(f"{v['title']} ({counts[k]})", f"adm:d:{k}:new:0")] for k, v in TABLES.items()]
-    rows.append([("📦 Download DB backup", "adm:backup")])
     await apex._send(q, text, _kb(rows + [[("‹ Admin", "adm:home")]]))
 
 
@@ -244,56 +243,3 @@ async def cb_csv(q: CallbackQuery):
                                                 "Delete it when you're done.")
     except TelegramAPIError as e:
         logger.warning(f"csv send: {e}")
-
-
-# ── Sanitised database backup ────────────────────────────────────────────────
-def build_backup() -> Tuple[str, bytes]:
-    """Copy of the live database with every encrypted-key column emptied, so the file that
-    leaves the server can never be used to recover a wallet."""
-    import os
-    import sqlite3
-    import tempfile
-    tmp = os.path.join(tempfile.mkdtemp(), "clex_backup.db")
-    src = sqlite3.connect(f"file:{apex.DB_PATH}?mode=ro", uri=True)
-    dst = sqlite3.connect(tmp)
-    try:
-        src.backup(dst)
-        for (t,) in dst.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall():
-            for col in dst.execute(f'PRAGMA table_info("{t}")').fetchall():
-                if any(w in col[1].lower() for w in ("encrypt", "secret", "private", "seed", "mnemonic")):
-                    dst.execute(f"UPDATE \"{t}\" SET \"{col[1]}\" = ''")
-        dst.commit()
-        dst.execute("VACUUM")
-    finally:
-        src.close()
-        dst.close()
-    try:
-        with open(tmp, "rb") as f:
-            data = f.read()
-    finally:
-        try:
-            os.remove(tmp)
-        except OSError:
-            pass
-    return f"clex_backup_{time.strftime('%Y%m%d_%H%M', time.gmtime())}.db", data
-
-
-@router.callback_query(F.data == "adm:backup")
-async def cb_backup(q: CallbackQuery):
-    if not await _guard(q):
-        return
-    try:
-        import asyncio
-        name, data = await asyncio.to_thread(build_backup)
-    except Exception as e:
-        logger.warning(f"backup: {e}")
-        await q.answer("Backup failed", show_alert=True)
-        return
-    await q.answer()
-    try:
-        await q.message.answer_document(
-            BufferedInputFile(data, name), protect_content=True,
-            caption="📦 Database backup. Wallet keys are removed from this copy. "
-                    "Open it in DB Browser for SQLite. Delete it when done.")
-    except TelegramAPIError as e:
-        logger.warning(f"backup send: {e}")
