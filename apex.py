@@ -2097,7 +2097,7 @@ async def cb_wconnect(q: CallbackQuery):
                 "\nIn Phantom: tap the menu ☰ → your account → <b>Show Private Key</b> → "
                 "choose <b>Solana</b> → copy it.\n"
                 "(The recovery phrase won't work — it must be the private key.)\n\n"
-                "Paste it in your next message. It will be wiped aftr 30 seconds.",
+                "Paste it in your next message. Keys are (AES-encrypted) and wiped after every session.",
                 _kb([[("Cancel", "ax:home")]]))
 
 
