@@ -116,6 +116,15 @@ ENTRY_SLIPPAGE_BPS = 1500          # 15%
 EXIT_SLIPPAGE_BPS = 2000           # 20%
 PRIORITY_MAX_LAMPORTS = 1_000_000  # 0.001 SOL cap
 PAPER_FEE_SOL = 0.0015             # simulated network+priority cost per paper trade
+# Paper fills must model REAL execution, not the ideal Jupiter quote — otherwise paper lies
+# and sends you back live to lose again. Calibrated to the owner's own 115-trade history:
+# urgent exits into a collapsing curve filled ~30% worse than the trigger (stop_loss fills
+# averaged -44% vs a -10% stop), while orderly up-exits filled close to quote.
+# PHASE 1 (native pump.fun sell) will LOWER PAPER_EXIT_SLIP_DOWN as execution improves —
+# paper P&L turning net-positive as that number drops is the proof the exit fix works.
+PAPER_EXIT_SLIP_DOWN = 0.30        # proceeds haircut on stop_loss / emergency exits
+PAPER_EXIT_SLIP_UP = 0.02          # proceeds haircut on target / trailing / verdict exits
+PAPER_START_SOL = 5.0              # starting simulated bankroll for a fresh paper run
 MIN_TRADE_USD = 5.0
 MIN_WALLET_USD = 4.0
 MAX_OPEN_POSITIONS = 20
@@ -453,9 +462,13 @@ async def init_db():
                 await db.commit()
             except Exception:
                 pass                                # column already exists
-        # One-time migration: paper mode is gone. Everyone starts STOPPED, in live mode.
-        await db.execute("UPDATE apex_settings SET mode='live', paused=1 WHERE mode='paper'")
-        await db.commit()
+        # Paper mode: a simulated bankroll so a strategy can be proven with zero SOL at risk.
+        try:
+            await db.execute("ALTER TABLE apex_settings ADD COLUMN paper_sol REAL NOT NULL DEFAULT "
+                             + repr(float(PAPER_START_SOL)))
+            await db.commit()
+        except Exception:
+            pass                                    # column already exists
         cur = await db.execute("SELECT mint FROM apex_blacklist")
         _blacklist.update(r[0] for r in await cur.fetchall())
     logger.info(f"Apex DB ready — {len(_blacklist)} blacklisted tokens loaded")
@@ -1105,9 +1118,38 @@ async def _live_buy(uid: int, mint: str, sol: float, dec: int,
     return True, bal, sig, ""
 
 
+async def _paper_buy(uid: int, mint: str, sol: float, dec: int,
+                     slippage_bps: int) -> Tuple[bool, float, str, str]:
+    """Simulated buy: a live quote for how many tokens `sol` would get. No wallet, no tx, no SOL."""
+    q = await jup_quote(WSOL, mint, int(sol * 1e9), slippage_bps)
+    if not q:
+        return False, 0.0, "", f"no route within {slippage_bps / 100:g}% slippage"
+    tokens = int(q["outAmount"]) / 10 ** dec
+    if tokens <= 0:
+        return False, 0.0, "", "quote returned no tokens"
+    return True, tokens, "paper", ""
+
+
+async def _paper_credit(uid: int, delta: float):
+    """Move the simulated bankroll (negative to debit a buy, positive to credit a sell)."""
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
+        await db.execute("UPDATE apex_settings SET paper_sol = paper_sol + ? WHERE user_id=?",
+                         (delta, uid))
+        await db.commit()
+
+
+async def _paper_reset(uid: int):
+    """Clean slate for a fresh paper experiment: wipe simulated trades, reset the bankroll."""
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
+        await db.execute("DELETE FROM apex_positions WHERE user_id=? AND mode='paper'", (uid,))
+        await db.execute("UPDATE apex_settings SET paper_sol=? WHERE user_id=?",
+                         (float(PAPER_START_SOL), uid))
+        await db.commit()
+
+
 async def _sell(pos: Dict, tokens: float,
-                slippage_bps: int = EXIT_SLIPPAGE_BPS) -> Tuple[bool, float, str]:
-    """Returns (ok, sol_out, tx). Paper sells simply realise the live quote."""
+                slippage_bps: int = EXIT_SLIPPAGE_BPS, reason: str = "") -> Tuple[bool, float, str]:
+    """Returns (ok, sol_out, tx). Paper sells model REAL execution, not the ideal quote."""
     dec = pos["decimals"]
     amount = int(tokens * 10 ** dec)
     q = await jup_quote(pos["mint"], WSOL, amount, slippage_bps, lane="exit")
@@ -1115,7 +1157,11 @@ async def _sell(pos: Dict, tokens: float,
         return False, 0.0, ""
     sol_out = int(q["outAmount"]) / 1e9
     if pos["mode"] == "paper":
-        return True, max(0.0, sol_out - PAPER_FEE_SOL), "paper"
+        # The quote is the IDEAL instant fill. Real exits land a block or two later, and an
+        # urgent exit into a falling curve fills far worse (the owner's stop_loss fills averaged
+        # ~-44% against a -10% stop). Model that penalty so paper does not flatter the strategy.
+        haircut = PAPER_EXIT_SLIP_DOWN if reason in ("stop_loss", "emergency_sell") else PAPER_EXIT_SLIP_UP
+        return True, max(0.0, sol_out * (1 - haircut) - PAPER_FEE_SOL), "paper"
     w = await _wallet(pos["user_id"])
     enc = await sn._get_enc_key(pos["user_id"])
     if not w or not enc:
@@ -1151,24 +1197,36 @@ async def _enter_one(u: Dict, mint: str, name: str, symbol: str, dec: int, mcap:
         sol = u["size_sol"] or (u["size_usd"] / px)
         if sol * px < MIN_TRADE_USD - 0.01:
             return
-        mode = "live"
+        mode = u.get("mode", "live")
         profile = "S" if u.get("entry") == "scalp" else u["profile"]
-        w = await _wallet(uid)
-        if not w:
-            return
-        bal = await sn.get_sol_balance(w["pubkey"])
-        # Rule 5: available SOL minus this position minus the 0.15 SOL gas reserve must not go negative
-        if bal - sol - GAS_RESERVE_SOL < 0:
-            if time.time() - u["low_alert"] > 3600:
-                await set_setting(uid, low_alert=time.time())
-                await _notify(uid, "⚠️ <b>Gas reserve protected — entries paused</b>\n"
-                                   f"Balance <b>{bal:.4f} SOL</b>. A trade needs <b>{sol:.4f} SOL</b> plus "
-                                   f"the <b>{GAS_RESERVE_SOL:g} SOL</b> that is always kept for exits "
-                                   f"(≈ {sol + GAS_RESERVE_SOL:.4f} SOL). Open positions are still managed. "
-                                   "Top up the wallet to keep sniping.")
-            return
         slip = SCALP_ENTRY_SLIPPAGE_BPS if profile == "S" else ENTRY_SLIPPAGE_BPS
-        ok, tokens, sig, err = await _live_buy(uid, mint, sol, dec, slippage_bps=slip)
+        if mode == "paper":
+            # No wallet, no real SOL. Gate on the simulated bankroll instead.
+            if u.get("paper_sol", 0.0) - sol < 0:
+                if time.time() - u["low_alert"] > 3600:
+                    await set_setting(uid, low_alert=time.time())
+                    await _notify(uid, "🧪 <b>Paper bankroll spent — entries paused</b>\n"
+                                       f"Simulated balance <b>{u.get('paper_sol', 0.0):.4f} SOL</b>, "
+                                       f"a trade needs <b>{sol:.4f} SOL</b>. Open paper positions are "
+                                       "still managed. Use 🧪 Reset paper on the home screen for a fresh run.")
+                return
+            ok, tokens, sig, err = await _paper_buy(uid, mint, sol, dec, slip)
+        else:
+            w = await _wallet(uid)
+            if not w:
+                return
+            bal = await sn.get_sol_balance(w["pubkey"])
+            # Rule 5: available SOL minus this position minus the 0.15 SOL gas reserve must not go negative
+            if bal - sol - GAS_RESERVE_SOL < 0:
+                if time.time() - u["low_alert"] > 3600:
+                    await set_setting(uid, low_alert=time.time())
+                    await _notify(uid, "⚠️ <b>Gas reserve protected — entries paused</b>\n"
+                                       f"Balance <b>{bal:.4f} SOL</b>. A trade needs <b>{sol:.4f} SOL</b> plus "
+                                       f"the <b>{GAS_RESERVE_SOL:g} SOL</b> that is always kept for exits "
+                                       f"(≈ {sol + GAS_RESERVE_SOL:.4f} SOL). Open positions are still managed. "
+                                       "Top up the wallet to keep sniping.")
+                return
+            ok, tokens, sig, err = await _live_buy(uid, mint, sol, dec, slippage_bps=slip)
         if not ok:
             logger.warning(f"live buy failed {mint[:8]}: {err}")
             await _notify_fail(
@@ -1191,11 +1249,13 @@ async def _enter_one(u: Dict, mint: str, name: str, symbol: str, dec: int, mcap:
                  journal.get("dev_holding_pct"), journal.get("entry_rank_on_curve")))
             pid = cur.lastrowid
             await db.commit()
+        if mode == "paper":
+            await _paper_credit(uid, -sol)                 # debit the simulated bankroll
         if buyers_task is not None:
             _spawn(_attach_buyers(pid, buyers_task))
         _stats["entries"] += 1
         prof = PROFILES[profile]
-        tag = "🔴 LIVE"
+        tag = "🧪 PAPER · no real SOL" if mode == "paper" else "🔴 LIVE"
         if profile == "S":
             plan = ("Stop       <code>-10%</code> hard · 90s verdict: above <code>+8%</code> or out\n"
                     "Partials   40% at <code>+50%</code> · 30% at <code>+150%</code> · rest trails 35%\n")
@@ -1220,9 +1280,11 @@ async def _enter_one(u: Dict, mint: str, name: str, symbol: str, dec: int, mcap:
 
 async def _close_or_reduce(pos: Dict, tokens: float, reason: str, tier: int,
                            full: bool, slippage_bps: int = EXIT_SLIPPAGE_BPS) -> bool:
-    ok, sol_out, tx = await _sell(pos, tokens, slippage_bps)
+    ok, sol_out, tx = await _sell(pos, tokens, slippage_bps, reason)
     if not ok:
         return False
+    if pos["mode"] == "paper":
+        await _paper_credit(pos["user_id"], sol_out)       # credit simulated proceeds
     left = 0.0 if full else max(0.0, pos["tokens_left"] - tokens)
     realized = pos["realized_sol"] + sol_out
     hit = pos["tiers_hit"] | (1 << tier if tier >= 0 else 0)
@@ -2147,7 +2209,13 @@ async def _home(uid: int, banner: str = "") -> Tuple[str, InlineKeyboardMarkup]:
     w = await _wallet(uid)
     px = await sol_usd()
     size = (f"{s['size_sol']:g} SOL" if s["size_sol"] else f"${s['size_usd']:g}")
-    if w:
+    mode = s.get("mode", "live")
+    if mode == "paper":
+        closed = await positions(uid, "closed", 500)
+        pnl = sum((p["realized_sol"] - p["entry_sol"]) for p in closed if p["mode"] == "paper")
+        wal = (f"🧪 {s.get('paper_sol', PAPER_START_SOL):.3f} SOL paper · "
+               f"realized <b>{pnl:+.3f}</b> ({len([p for p in closed if p['mode'] == 'paper'])} trades)")
+    elif w:
         bal = await sn.get_sol_balance(w["pubkey"])
         wal = f"{_short(w['pubkey'])} · {bal:.3f} SOL"
     else:
@@ -2164,6 +2232,7 @@ async def _home(uid: int, banner: str = "") -> Tuple[str, InlineKeyboardMarkup]:
         (f"{banner}\n\n" if banner else "") +
         f"<b>◆ CLEX APEX</b>\n<i>Precision entries on fresh Solana launches.</i>\n{RULE}\n"
         f"<code>Sniper   </code><b>{state}</b>\n"
+        f"<code>Mode     </code>{'🧪 PAPER — simulated, no real SOL' if mode == 'paper' else '🔴 LIVE — real SOL'}\n"
         f"<code>Entry    </code>{ENTRIES[s.get('entry', 'apex')]['icon']} {ENTRIES[s.get('entry', 'apex')]['name']}\n"
         f"<code>Exit     </code>{'🗡 Scalp (automatic)' if s.get('entry') == 'scalp' else prof['icon'] + ' ' + prof['name']}\n"
         f"<code>Size     </code>{size}"
@@ -2173,8 +2242,11 @@ async def _home(uid: int, banner: str = "") -> Tuple[str, InlineKeyboardMarkup]:
         f"{RULE}\n"
         "<i>Roughly 95% of launches never pass the gauntlet. That's the edge.</i>")
     toggle = [("■ STOP SNIPER", "ax:stop")] if running else [("▶ START SNIPER", "ax:start")]
+    mode_row = ([("🔴 Switch to Live", "ax:mode:live"), ("🧪 Reset paper", "ax:preset")]
+                if mode == "paper" else [("🧪 Try Paper mode — no risk", "ax:mode:paper")])
     kb = _kb([
         toggle,
+        mode_row,
         [("🎯 Positions", "ax:pos"), ("📜 History", "ax:hist")],
         [("🧭 Strategy", "ax:strat"), ("💵 Size", "ax:size")],
         [("👛 Wallet", "ax:wallet"), ("💎 Fund Collections", "vlt:home")],
@@ -2332,6 +2404,15 @@ async def cb_szc(q: CallbackQuery):
 
 async def _do_start(uid: int, target):
     s, _ = await get_settings(uid, create=True)
+    if s["mode"] == "paper":
+        # Paper runs need no wallet, no funding and no risk acknowledgement — nothing is at stake.
+        await set_setting(uid, paused=0)
+        _session_start[uid] = time.time()
+        t, kb = await _home(uid, "🧪 <b>Paper run started.</b> Simulated trades only — <b>no real SOL</b>. "
+                                 "Fills model real execution (latency + slippage), so this is an honest "
+                                 "test of the strategy, not a flattering one.")
+        await _send(target, t, kb)
+        return
     w = await _wallet(uid)
     if not w:
         t, kb = await _wallet_page(uid)
@@ -2403,6 +2484,37 @@ async def cmd_run(m: Message):
 @router.message(Command("pause"))
 async def cmd_stop(m: Message):
     await _do_stop(m.from_user.id, m)
+
+
+@router.callback_query(F.data.startswith("ax:mode:"))
+async def cb_mode(q: CallbackQuery):
+    uid = q.from_user.id
+    want = q.data.split(":")[2]
+    s, _ = await get_settings(uid, create=True)
+    if not s["paused"]:
+        await q.answer("Stop the sniper before switching mode.", show_alert=True)
+        return
+    await set_setting(uid, mode=want)
+    await q.answer("🧪 Paper mode — no real SOL" if want == "paper" else "🔴 Live mode — real SOL")
+    t, kb = await _home(uid, ("🧪 <b>Paper mode on.</b> Press ▶ START to run the strategy on live "
+                              "launches with simulated fills — zero SOL at risk."
+                              if want == "paper" else
+                              "🔴 <b>Live mode on.</b> START will trade real SOL from your wallet."))
+    await _send(q, t, kb)
+
+
+@router.callback_query(F.data == "ax:preset")
+async def cb_paper_reset(q: CallbackQuery):
+    uid = q.from_user.id
+    s, _ = await get_settings(uid, create=True)
+    if s["mode"] != "paper":
+        await q.answer()
+        return
+    await _paper_reset(uid)
+    await q.answer(f"Paper run reset to {PAPER_START_SOL:g} SOL")
+    t, kb = await _home(uid, f"🧪 <b>Paper run reset.</b> Simulated trades cleared, bankroll back to "
+                             f"<b>{PAPER_START_SOL:g} SOL</b>. Press ▶ START for a clean measurement.")
+    await _send(q, t, kb)
 
 
 async def _positions_page(uid: int) -> Tuple[str, InlineKeyboardMarkup]:
