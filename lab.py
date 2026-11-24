@@ -1165,6 +1165,14 @@ async def _supervise(name: str, fn, period: float, first: float = 0.0):
         await asyncio.sleep(period)
 
 
+async def _heartbeat():
+    """One log line every 5 minutes so the tracker can be verified from the platform logs."""
+    d = await _daily_totals()
+    logger.info(f"Lab heartbeat: tracking={len(_active)} launches={d['launches']} admitted={d['admitted']} "
+                f"settled={d['settled']} dead={d['dead']} dropped={d['dropped']} fwd_trades={d['trades']} "
+                f"calls_today={calls_today()}")
+
+
 async def _eval_job():
     changes = await evaluate_all()
     admin = apex._access.get("admin")
@@ -1194,6 +1202,7 @@ async def startup(bot=None):
     _tasks.extend([
         asyncio.create_task(_poll_loop()),
         asyncio.create_task(_supervise("flush", flush_counters, 60, 60)),
+        asyncio.create_task(_supervise("heartbeat", _heartbeat, 300, 120)),
         asyncio.create_task(_supervise("eval", _eval_job, EVAL_EVERY_S, 300)),
         asyncio.create_task(_supervise("evolve", _evolve_job, EVOLVE_EVERY_S, EVOLVE_EVERY_S)),
         asyncio.create_task(_supervise("digest", digest, DIGEST_EVERY_S, 3600)),
