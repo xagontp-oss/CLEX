@@ -1241,8 +1241,7 @@ async def webhook(req: Request):
 
 @app.get("/")
 async def health():
-    return {"status": "alive", "watchlist": len(watchlist),
-            "startup_slot": _startup_slot}
+    return {"status": "alive"}          # nothing about internals is public
 
 if __name__ == "__main__":
     import uvicorn

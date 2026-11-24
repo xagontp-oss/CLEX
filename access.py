@@ -46,6 +46,11 @@ try:
 except ValueError:
     ADMIN_ID = 0
 
+# PRIVATE MODE (default ON): only ADMIN_ID can use the bot, the Lab, the Terminal or anything else.
+# Invites are disabled, and users who joined earlier are treated as not allowed. Their open positions
+# are still managed to a close so nothing is stranded. Set OWNER_ONLY=0 to release it to invited users.
+OWNER_ONLY = os.getenv("OWNER_ONLY", "1") != "0"
+
 RULE = apex.RULE
 _bot = None
 _bot_username = ""
@@ -100,6 +105,8 @@ def _rec(uid: int) -> Optional[Dict]:
 def is_allowed(uid: int) -> bool:
     if is_admin(uid):
         return True
+    if OWNER_ONLY:
+        return False
     r = _rec(uid)
     return bool(r and r.get("status") == "allowed")
 
@@ -141,7 +148,7 @@ def invite_state(token: str) -> str:
 
 def redeem(token: str, uid: int, name: str, username: str) -> bool:
     """Consume a valid, unused, unexpired invite and grant access."""
-    if invite_state(token) != "valid" or is_blocked(uid):
+    if OWNER_ONLY or invite_state(token) != "valid" or is_blocked(uid):
         return False
     store.invites[token]["used_by"] = uid
     store.users[str(uid)] = {"status": "allowed", "name": name, "username": username,
@@ -196,6 +203,10 @@ class AccessMiddleware(BaseMiddleware):
         if is_allowed(uid):
             _touch(uid, user)
             return await handler(event, data)
+
+        if OWNER_ONLY:                                     # private mode: no invites, no onboarding, no hints
+            await _deny(event, is_cb, "🔒 <b>CLEX is private.</b>")
+            return None
 
         if is_blocked(uid):
             await _deny(event, is_cb, "🚫 <b>Access removed.</b>\nThis account no longer has access to CLEX Apex.")
@@ -342,7 +353,8 @@ async def _admin_home():
             f"<code>Sniping   </code>{running} running now\n"
             f"<code>Open pos. </code>{open_pos}\n"
             f"<code>Invites   </code>{len(pending_invites())} pending\n"
-            f"{RULE}\n<i>Only you can see this panel.</i>")
+            f"{RULE}\n<i>Only you can see this panel.</i>"
+            + ("\n🔒 <b>PRIVATE MODE</b> · owner only, invites off" if OWNER_ONLY else ""))
     kb = _kb([[("👥 Users", "adm:users:0"), ("➕ New invite link", "adm:inv")],
               [("🔗 Pending invites", "adm:invs"), ("🗄 Data", "adm:data")],
               [("🧪 Lab", "lab:home")], [("‹ Home", "ax:home")]])
@@ -500,6 +512,9 @@ def _link(token: str) -> str:
 async def cb_inv(q: CallbackQuery):
     if not await _guard(q):
         return
+    if OWNER_ONLY:
+        await q.answer("Private mode is on: invites are disabled. Set OWNER_ONLY=0 to release.", show_alert=True)
+        return
     token, exp = create_invite()
     until = datetime.fromtimestamp(exp, timezone.utc).strftime("%H:%M UTC")
     await apex._send(q, f"<b>🔗 Invite link</b>\n{RULE}\n<code>{_link(token)}</code>\n\n"
@@ -556,6 +571,9 @@ async def startup(bot):
         logger.info(f"Access list created — {len(store.users)} existing users kept")
     apex.set_access_hooks(is_blocked=lambda uid: is_blocked(uid) or (not is_allowed(uid)),
                           admin_id=ADMIN_ID)
+    logger.info("PRIVATE MODE: owner only (OWNER_ONLY=0 to release)" if OWNER_ONLY else "Invite-only mode (OWNER_ONLY=0)")
+    if OWNER_ONLY and not ADMIN_ID:
+        logger.error("OWNER_ONLY is on but ADMIN_ID is not set: nobody can use the bot. Send /myid, set ADMIN_ID.")
     if not ADMIN_ID:
         logger.warning("ADMIN_ID is not set: the admin panel is disabled. Send /myid to the bot, "
                        "then set ADMIN_ID in Railway Variables.")
