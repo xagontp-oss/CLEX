@@ -29,6 +29,7 @@ from aiogram.types import (BufferedInputFile, CallbackQuery, InlineKeyboardButto
                            InlineKeyboardMarkup, Message)
 
 import curve
+import pumpnative as pn
 import risk
 import sniper as sn
 
@@ -118,6 +119,10 @@ GAS_RESERVE_SOL = 0.15
 ENTRY_SLIPPAGE_BPS = 1500          # 15%
 EXIT_SLIPPAGE_BPS = 2000           # 20%
 PRIORITY_MAX_LAMPORTS = 1_000_000  # 0.001 SOL cap
+NATIVE_TX_ENABLED = os.getenv("NATIVE_TX_ENABLED", "0") == "1"   # native pump.fun sells (default OFF until verified live)
+PRESIGN_REFRESH_SECS = 25             # a pre-signed exit is rebuilt this often (fresh blockhash)
+PRESIGN_MAX_AGE_SECS = 45             # ...and never used older than this
+PRESIGN_REASONS = ("stop_loss", "trailing_stop", "verdict_90s", "emergency_sell")   # urgent: accept any fill
 MAX_PRICE_IMPACT_PCT = 15.0           # our buy may move the curve price at most this much
 MAX_PRICE_IMPACT_PCT_SCALP = 12.0     # tighter for scalps (thinner curves)
 PAPER_FEE_SOL = 0.0015             # simulated network+priority cost per paper trade
@@ -1212,10 +1217,168 @@ async def _paper_reset(uid: int):
         await db.commit()
 
 
+# ── native pump.fun sells ────────────────────────────────────────────────────
+# Per open live position: {"elig": bool, "at": ts, "tp": token program, "info": last curve, "pre": (tx, ts, raw)}
+_native: Dict[int, Dict] = {}
+_native_told = {"ok": False, "bad": False}
+
+
+async def _blockhash() -> Optional[str]:
+    r = await _h("getLatestBlockhash", [{"commitment": "confirmed"}])
+    try:
+        return r["value"]["blockhash"]
+    except Exception:
+        return None
+
+
+async def _native_state(pos: Dict) -> Optional[Dict]:
+    """Is this position safe to sell natively? Decided once per position by SIMULATING the exact sell
+    against the chain (no signature, no spend). A failed check is retried after 2 minutes."""
+    if pos["mode"] != "live":
+        return None
+    st = _native.get(pos["id"])
+    if st and (st["elig"] or time.time() - st["at"] < 120):
+        return st if st["elig"] else None
+    st = {"elig": False, "at": time.time(), "tp": None, "info": None, "pre": None}
+    _native[pos["id"]] = st
+    why = ""
+    try:
+        w = await _wallet(pos["user_id"])
+        info = await pn.fetch_info(_h, pos["mint"])
+        glob = await pn.fetch_global(_h, time.time())
+        tp = await pn.token_program_of(_h, pos["mint"])
+        bh = await _blockhash()
+        if not (w and info and glob and tp and bh):
+            why = "could not read curve/global/mint"
+        elif not info.eligible:
+            why = "not a plain curve coin (cashback, mayhem, graduated or unknown layout)"
+        else:
+            from solders.pubkey import Pubkey
+            user = Pubkey.from_string(w["pubkey"])
+            raw_amt = int(pos["tokens_left"] * 10 ** pos["decimals"])
+            ix = pn.sell_ix(user, Pubkey.from_string(pos["mint"]), tp, info, glob, raw_amt, 1)
+            ok, err, cu = await pn.simulate(_h, pn.build_sell_tx(user, ix, bh, PRIORITY_MAX_LAMPORTS))
+            if ok:
+                st.update(elig=True, tp=tp, info=info)
+            else:
+                why = f"simulation failed: {err}"
+    except Exception as e:
+        why = f"error: {e}"
+    if not st["elig"]:
+        logger.info(f"native sell not used for {pos['mint'][:8]}: {why}")
+    key = "ok" if st["elig"] else "bad"
+    if not _native_told[key] and _access["admin"]:
+        _native_told[key] = True
+        await _notify(_access["admin"], "⚡ <b>Native sell " + ("verified" if st["elig"] else "check failed") +
+                      "</b> on a live position (" + html.escape(pos["mint"][:8]) + ")\n" +
+                      ("The exact sell transaction simulates cleanly; exits will use it, with Jupiter as the fallback."
+                       if st["elig"] else html.escape(why[:300]) + "\nThis coin keeps using Jupiter."))
+    return st if st["elig"] else None
+
+
+async def _native_value(pos: Dict, tokens: float) -> Optional[float]:
+    """SOL the bag would fetch right now, from the curve account itself (no quote API)."""
+    st = await _native_state(pos)
+    if not st:
+        return None
+    info = await pn.fetch_info(_h, pos["mint"])
+    if not info or not info.eligible:
+        return None
+    st["info"] = info
+    return pn.estimate_out_sol(info, tokens)
+
+
+async def _native_refresh(pid: int):
+    """Keep a signed full-bag sell ready, so a stop is a submit rather than build + sign + submit."""
+    pos = await get_position(pid)
+    if not pos or pos["status"] != "open" or pos["mode"] != "live":
+        return
+    st = _native.get(pid)
+    if not st or not st["elig"]:
+        return
+    raw_amt = int(pos["tokens_left"] * 10 ** pos["decimals"])
+    pre = st.get("pre")
+    if pre and time.time() - pre[1] < PRESIGN_REFRESH_SECS and pre[2] == raw_amt:
+        return
+    enc = await sn._get_enc_key(pos["user_id"])
+    glob = await pn.fetch_global(_h, time.time())
+    bh = await _blockhash()
+    if not (enc and glob and bh and st.get("info")):
+        return
+    from solders.pubkey import Pubkey
+    kp = sn.load_keypair(enc)
+    w = await _wallet(pos["user_id"])
+    if not w or str(kp.pubkey()) != w["pubkey"]:
+        return
+    ix = pn.sell_ix(kp.pubkey(), Pubkey.from_string(pos["mint"]), st["tp"], st["info"], glob, raw_amt, 1)
+    st["pre"] = (pn.build_sell_tx(kp.pubkey(), ix, bh, PRIORITY_MAX_LAMPORTS, signer=kp), time.time(), raw_amt)
+
+
+async def _native_sell(pos: Dict, tokens: float, reason: str, slippage_bps: int,
+                       trig_price: Optional[float]) -> Optional[Tuple[bool, float, str]]:
+    """Sell straight into the bonding curve. Returns (True, sol_out, sig) when it landed, or None when
+    the caller should use Jupiter (not eligible, would not send, failed on chain, or never landed)."""
+    st = await _native_state(pos)
+    if not st:
+        return None
+    info = await pn.fetch_info(_h, pos["mint"])
+    if not info or not info.eligible:
+        return None
+    w = await _wallet(pos["user_id"])
+    enc = await sn._get_enc_key(pos["user_id"])
+    glob = await pn.fetch_global(_h, time.time())
+    if not (w and enc and glob):
+        return None
+    raw_amt = int(tokens * 10 ** pos["decimals"])
+    urgent = reason in PRESIGN_REASONS
+    pre = st.get("pre")
+    if urgent and pre and time.time() - pre[1] < PRESIGN_MAX_AGE_SECS and pre[2] == raw_amt:
+        tx, how = pre[0], "pre-signed"
+    else:
+        bh = await _blockhash()
+        if not bh:
+            return None
+        from solders.pubkey import Pubkey
+        kp = sn.load_keypair(enc)
+        if str(kp.pubkey()) != w["pubkey"]:
+            return None
+        min_out = pn.min_out_for(info, tokens, 10_000 if urgent else slippage_bps)
+        ix = pn.sell_ix(kp.pubkey(), Pubkey.from_string(pos["mint"]), st["tp"] or await pn.token_program_of(_h, pos["mint"]),
+                        info, glob, raw_amt, min_out)
+        tx, how = pn.build_sell_tx(kp.pubkey(), ix, bh, PRIORITY_MAX_LAMPORTS, signer=kp), "built"
+    st["pre"] = None                                           # a signed tx is single use
+    t0 = time.time()
+    sig = await sn.send_signed_fast(tx, True)
+    if not sig:
+        return None
+    status, _err = await _confirm_tx(sig)
+    est = pn.estimate_out_sol(info, tokens)
+    if status == "timeout":
+        left = await sn.get_token_balance(w["pubkey"], pos["mint"])    # did it land after all? never sell twice
+        if left < tokens * 0.5:
+            status = "ok"
+    if status != "ok":
+        logger.info(f"native sell {pos['mint'][:8]} {how} -> {status}; falling back to Jupiter")
+        return None
+    got = await _tx_sol_delta(sig, w["pubkey"])
+    sol_out = got if (got and got > 0) else est
+    await _log_slip(pos["mint"], "sell", "native", trig_price or (est / tokens), sol_out / tokens)
+    logger.info(f"native sell {pos['mint'][:8]} {how} landed in {time.time() - t0:.1f}s ({reason}) -> {sol_out:.4f} SOL")
+    return True, sol_out, sig
+
+
 async def _sell(pos: Dict, tokens: float,
                 slippage_bps: int = EXIT_SLIPPAGE_BPS, reason: str = "",
                 trig_price: Optional[float] = None) -> Tuple[bool, float, str]:
     """Returns (ok, sol_out, tx). Paper sells model REAL execution, not the ideal quote."""
+    if NATIVE_TX_ENABLED and pos["mode"] == "live":
+        try:
+            res = await _native_sell(pos, tokens, reason, slippage_bps, trig_price)
+        except Exception as e:
+            logger.warning(f"native sell error {pos['mint'][:8]}: {e}")
+            res = None
+        if res:
+            return res
     dec = pos["decimals"]
     amount = int(tokens * 10 ** dec)
     q = await jup_quote(pos["mint"], WSOL, amount, slippage_bps, lane="exit")
@@ -1497,9 +1660,15 @@ async def _manage(pos: Dict):
         tokens = pos["tokens_left"]
         if tokens <= 0:
             return
-        q = await jup_quote(pos["mint"], WSOL, int(tokens * 10 ** pos["decimals"]),
-                            EXIT_SLIPPAGE_BPS, lane="exit")
-        if not q:
+        value = None
+        if NATIVE_TX_ENABLED and pos["mode"] == "live":
+            try:
+                value = await _native_value(pos, tokens)          # price straight from the curve account
+            except Exception as e:
+                logger.debug(f"native value {pos['mint'][:8]}: {e}")
+        q = None if value is not None else await jup_quote(
+            pos["mint"], WSOL, int(tokens * 10 ** pos["decimals"]), EXIT_SLIPPAGE_BPS, lane="exit")
+        if value is None and not q:
             fails = pos["fails"] + 1
             if fails >= _dead_fails(pos):
                 await _update_pos(pos["id"], status="closed", exit_ts=time.time(),
@@ -1511,7 +1680,8 @@ async def _manage(pos: Dict):
             else:
                 await _update_pos(pos["id"], fails=fails)
             return
-        value = int(q["outAmount"]) / 1e9
+        if value is None:
+            value = int(q["outAmount"]) / 1e9
         ratio = (value / tokens) / pos["entry_price"] if pos["entry_price"] else 1.0
         d = decide_exit(pos["profile"], ratio, pos["tiers_hit"], pos["peak_ratio"],
                         pos["clock_start"], time.time())
@@ -1601,8 +1771,14 @@ async def _position_worker(pid: int):
         _beats[pid] = time.time()
         pos = await get_position(pid)
         if not pos or pos["status"] != "open" or pos["tokens_left"] <= 0:
+            _native.pop(pid, None)
             return
         await asyncio.wait_for(_manage(pos), timeout=WORKER_STEP_TIMEOUT)
+        if NATIVE_TX_ENABLED and pos["mode"] == "live":
+            try:
+                await asyncio.wait_for(_native_refresh(pid), timeout=10)
+            except Exception as e:
+                logger.debug(f"presign refresh {pid}: {e}")
         _beats[pid] = time.time()
         await asyncio.sleep(_interval(pos))
 

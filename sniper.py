@@ -517,6 +517,18 @@ async def _send_tx(url: str, tx_b64: str, skip: bool) -> Optional[str]:
     except Exception:
         return None
 
+async def send_signed_fast(tx_bytes: bytes, skip: bool = True) -> Optional[str]:
+    """Send an ALREADY SIGNED transaction (a pre-signed exit) to the paid and the public node at once."""
+    tx_b64 = base64.b64encode(tx_bytes).decode()
+    results = await asyncio.gather(
+        _send_tx(_rpc_url(), tx_b64, skip),
+        _send_tx(PUBLIC_RPC, tx_b64, skip),
+        return_exceptions=True)
+    for r in results:
+        if isinstance(r, str) and r:
+            return r
+    return None
+
 async def send_transaction_fast(tx_bytes: bytes, keypair, skip: bool = True) -> Optional[str]:
     from solders.transaction import VersionedTransaction
     tx     = VersionedTransaction.from_bytes(tx_bytes)

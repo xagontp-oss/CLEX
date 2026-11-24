@@ -20,3 +20,14 @@ Native pump.fun buy/sell, pre-signed sells, Jito, gRPC streaming, MEV/failed-tx 
 - The spec's "DOA cut" (sell at 90s if never above 1.03) is already implied by the 90s verdict (sell unless above 1.08), so no extra rule was added.
 - A $5 live size is blocked with a message instead of being raised to 0.08 SOL.
 - Write-off is time based instead of 15 failed quotes (30s at a 2s poll would orphan held tokens during a Jupiter 429 burst).
+
+# Phase 2: native pump.fun sells (`pumpnative.py`, default OFF)
+
+Set `NATIVE_TX_ENABLED=1` to use it. Off by default until the first live position proves it.
+
+- **What it does:** sells straight into the bonding curve (no quote API, no swap-build API), prices the open bag from the curve account, and keeps a signed full-bag sell ready (rebuilt every 25s) so a stop is "submit" instead of "build, sign, submit".
+- **Layout:** the live program takes 16 accounts, not the 14 in the public IDL (extra: `bonding_curve_v2` PDA and one of `Global.buyback_fee_recipients`). Derived from real mainnet sells; every PDA the code derives is asserted equal to the addresses in a real sell transaction (tests/test_native.py).
+- **Eligibility:** only plain SOL-quoted curves. Cashback, mayhem-mode, graduated curves and any layout it does not recognise use Jupiter. Each position is checked once by SIMULATING the exact sell against the chain (no signature, no spend); the owner gets a Telegram note on the first pass or failure.
+- **Fallback:** no send, failed on chain, or never landed -> Jupiter in the same call. If a sell times out, the wallet balance is checked first so a sell that landed late is never repeated.
+- **Urgent exits** (stop, trailing, verdict, emergency) accept any fill (min-out 1) so they cannot fail on slippage; tier sells carry a min-out of the curve estimate less the slippage setting.
+- **Not done:** Jito bundles, gRPC streaming, a funded dust test. The owner should enable the flag only after reading the first "Native sell verified" message.
