@@ -52,7 +52,7 @@ logger = logging.getLogger("lab")
 ENABLED = os.getenv("LAB_ENABLED", "1") != "0"
 TICK_S = 5.0                      # poll period
 HORIZON_S = 900                   # track each coin for at most 15 minutes
-MAX_ACTIVE = int(os.getenv("LAB_MAX_ACTIVE", "160"))
+MAX_ACTIVE = int(os.getenv("LAB_MAX_ACTIVE", "300"))
 DAILY_CALLS = int(os.getenv("LAB_DAILY_CALLS", "120000"))    # Helius-call budget the lab may use per UTC day
 MAX_LAUNCH_AGE_S = 60             # only admit launches the webhook delivers within a minute
 DEAD_AT_S = 90                    # a coin with < DEAD_INFLOW SOL of net buying by then is dropped

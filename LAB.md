@@ -14,7 +14,7 @@ corrected lower confidence bound > 0; still > 0 without the 3 best trades; both 
 **Challengers** are spawned every 6 h as single-parameter neighbours of the best variants (never of controls).
 They start with zero evidence and raise the bar for everyone (Bonferroni over every variant ever registered).
 
-**Config (env):** `LAB_ENABLED=0` turns it off; `LAB_MAX_ACTIVE` (default 160 coins tracked at once);
+**Config (env):** `LAB_ENABLED=0` turns it off; `LAB_MAX_ACTIVE` (default 300 coins tracked at once);
 `LAB_DAILY_CALLS` (default 120000 Helius calls per UTC day).
 
 **Honest limits:** paper is not live (no MEV/sandwich, no failed transactions). Exits assume a fast native
