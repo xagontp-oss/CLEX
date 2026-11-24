@@ -1,0 +1,395 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="color-scheme" content="dark">
+<title>CLEX TERMINAL</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+:root{
+  --bg:#000; --panel:#050505; --line:#242424; --line2:#3a3a3a;
+  --fg:#d6d6d6; --dim:#7d7d7d; --faint:#4a4a4a;
+  --amber:#ffb000; --amber2:#7a5600; --up:#2fd27a; --dn:#ff4b3e; --cy:#4aa8d8;
+  --mono:ui-monospace,"Cascadia Mono","SF Mono",Consolas,"Liberation Mono",Menlo,monospace;
+}
+*{box-sizing:border-box;margin:0;padding:0;border-radius:0}
+html,body{background:var(--bg);color:var(--fg);font:12px/1.3 var(--mono);font-variant-numeric:tabular-nums;
+  -webkit-text-size-adjust:100%;overscroll-behavior:none}
+body{display:flex;flex-direction:column;height:100vh;height:100dvh;overflow:hidden}
+.up{color:var(--up)}.dn{color:var(--dn)}.am{color:var(--amber)}.dim{color:var(--dim)}.cy{color:var(--cy)}.faint{color:var(--faint)}
+.r{text-align:right}.c{text-align:center}.b{font-weight:700}.nw{white-space:nowrap}
+button,input{font:inherit;color:inherit;background:none;border:0;outline:0}
+/* top bar */
+#top{display:flex;align-items:stretch;border-bottom:1px solid var(--amber);flex:none}
+#brand{background:var(--amber);color:#000;font-weight:700;padding:5px 9px;letter-spacing:.08em;white-space:nowrap}
+#cmd{flex:1;display:flex;align-items:center;padding:0 8px;min-width:0}
+#cmd span{color:var(--amber);margin-right:6px}
+#cmd input{width:100%;text-transform:uppercase;caret-color:var(--amber);min-width:0}
+#clock{padding:0 9px;display:flex;align-items:center;color:var(--dim);white-space:nowrap;border-left:1px solid var(--line)}
+#link{padding:0 8px;display:flex;align-items:center;white-space:nowrap;border-left:1px solid var(--line)}
+/* ticker */
+#tick{display:flex;gap:0;overflow-x:auto;white-space:nowrap;border-bottom:1px solid var(--line);flex:none;scrollbar-width:none}
+#tick::-webkit-scrollbar{display:none}
+#tick div{padding:3px 10px;border-right:1px solid var(--line);flex:none}
+#tick b{color:var(--dim);font-weight:400;margin-right:6px}
+/* main */
+#main{flex:1;overflow-y:auto;overflow-x:hidden;padding:6px;-webkit-overflow-scrolling:touch}
+.grid{display:grid;gap:6px;grid-template-columns:repeat(auto-fit,minmax(min(100%,340px),1fr));align-items:start}
+.span2{grid-column:1/-1}
+.panel{border:1px solid var(--line);background:var(--panel);min-width:0}
+.ph{display:flex;justify-content:space-between;gap:8px;padding:3px 7px;background:#120d00;border-bottom:1px solid var(--amber2);
+  color:var(--amber);text-transform:uppercase;letter-spacing:.06em;font-size:11px}
+.ph i{font-style:normal;color:var(--dim);text-transform:none;letter-spacing:0}
+.pb{padding:5px 7px}
+.scroll{overflow-x:auto}
+table{border-collapse:collapse;width:100%}
+th{color:var(--dim);font-weight:400;text-align:right;padding:2px 6px;border-bottom:1px solid var(--line2);white-space:nowrap;
+  text-transform:uppercase;font-size:10px;letter-spacing:.04em;cursor:pointer;user-select:none}
+th.l,td.l{text-align:left}
+th.on{color:var(--amber)}
+td{padding:2px 6px;text-align:right;white-space:nowrap;border-bottom:1px solid #111}
+tr.sel td{background:#161000}
+tr.row{cursor:pointer}
+tr.row:active td{background:#1a1300}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:1px 12px}
+.kv div:nth-child(odd){color:var(--dim)}.kv div:nth-child(even){text-align:right}
+.kv2{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:0 14px}
+.kv2>div{display:flex;justify-content:space-between;gap:8px;padding:1px 0;border-bottom:1px solid #101010}
+.kv2>div span:first-child{color:var(--dim)}
+.bar{height:7px;background:#141414;border:1px solid var(--line2);position:relative}
+.bar>i{position:absolute;left:0;top:0;bottom:0;background:var(--amber)}
+.chart{width:100%;height:auto;display:block}
+.chart text{fill:var(--dim);font:9px var(--mono)}
+.pad{padding:14px;text-align:center}
+.tag{display:inline-block;padding:0 4px;border:1px solid currentColor;font-size:10px;letter-spacing:.04em}
+.hl{padding:6px 8px;border-left:3px solid var(--amber);background:#0c0900;margin-bottom:6px}
+.hl.bad{border-left-color:var(--dn)}.hl.good{border-left-color:var(--up)}
+.chk{display:grid;grid-template-columns:44px 1fr;gap:2px 8px}
+.err{padding:20px;color:var(--dn)}
+/* function keys */
+#keys{display:flex;border-top:1px solid var(--amber);flex:none;overflow-x:auto;scrollbar-width:none;padding-bottom:env(safe-area-inset-bottom)}
+#keys::-webkit-scrollbar{display:none}
+#keys button{flex:1 0 auto;padding:7px 10px;border-right:1px solid var(--line);white-space:nowrap;color:var(--dim)}
+#keys button b{color:var(--amber);font-weight:700;margin-right:5px}
+#keys button.on{background:var(--amber);color:#000}
+#keys button.on b{color:#000}
+@media (min-width:900px){body{font-size:13px}.ph{font-size:12px}}
+</style>
+</head>
+<body>
+<div id="top">
+  <div id="brand">CLEX TERMINAL</div>
+  <div id="cmd"><span>&gt;</span><input id="cmdin" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="DASH LAB MKT POS SYS HELP · VAR &lt;name&gt;"></div>
+  <div id="clock">--:--:--Z</div>
+  <div id="link" class="dim">NO LINK</div>
+</div>
+<div id="tick"></div>
+<div id="main"><div class="pad dim">CONNECTING...</div></div>
+<div id="keys"></div>
+
+<script>
+"use strict";
+const tg = (window.Telegram && window.Telegram.WebApp) || null;
+try { if (tg) { tg.ready(); tg.expand(); tg.setHeaderColor("#000000"); tg.setBackgroundColor("#000000"); } } catch (e) {}
+const INIT = (tg && tg.initData) || new URLSearchParams(location.hash.slice(1)).get("tgWebAppData") || "";
+const $ = (s) => document.querySelector(s);
+const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+
+/* ---------- formatting ---------- */
+const nul = (x) => x == null || (typeof x === "number" && !isFinite(x));
+const pct = (x, d = 1) => nul(x) ? "—" : (x >= 0 ? "+" : "") + (x * 100).toFixed(d) + "%";
+const pctU = (x, d = 1) => nul(x) ? "—" : (x * 100).toFixed(d) + "%";
+const num = (x, d = 0) => nul(x) ? "—" : Number(x).toLocaleString("en-US", {minimumFractionDigits: d, maximumFractionDigits: d});
+const sol = (x, d = 4) => nul(x) ? "—" : (x >= 0 ? "+" : "") + Number(x).toFixed(d);
+const sgn = (x) => nul(x) ? "dim" : x > 0 ? "up" : x < 0 ? "dn" : "";
+const C = (x, text) => `<span class="${sgn(x)}">${text}</span>`;
+const age = (s) => s < 90 ? Math.round(s) + "s" : s < 5400 ? Math.round(s / 60) + "m" : s < 172800 ? (s / 3600).toFixed(1) + "h" : (s / 86400).toFixed(1) + "d";
+const STATUS = {PASSED: "up", CONFIRMING: "am", WATCH: "cy", COLLECTING: "dim", RETIRED: "dn"};
+const tagS = (s) => `<span class="tag ${STATUS[s] || "dim"}">${esc(s)}</span>`;
+
+/* ---------- charts (hand-drawn SVG, no libraries) ---------- */
+function spark(v, w = 74, h = 16) {
+  if (!v || v.length < 2) return `<span class="faint">·</span>`;
+  const lo = Math.min(...v, 0), hi = Math.max(...v, 0), d = hi - lo || 1;
+  const pts = v.map((y, i) => `${(i / (v.length - 1) * (w - 2) + 1).toFixed(1)},${(h - 1 - (y - lo) / d * (h - 2)).toFixed(1)}`).join(" ");
+  const z = (h - 1 - (0 - lo) / d * (h - 2)).toFixed(1);
+  const col = v[v.length - 1] >= 0 ? "var(--up)" : "var(--dn)";
+  return `<svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" style="vertical-align:middle"><line x1="0" x2="${w}" y1="${z}" y2="${z}" stroke="#2a2a2a"/><polyline points="${pts}" fill="none" stroke="${col}" stroke-width="1.2"/></svg>`;
+}
+function lineChart(v, o = {}) {
+  if (!v || v.length < 2) return `<div class="pad dim">NO DATA YET</div>`;
+  const fmt = o.fmt || ((x) => x.toFixed(2)), W = 640, H = o.h || 150, pl = 50, pr = 6, pt = 8, pb = 16;
+  let lo = Math.min(...v), hi = Math.max(...v);
+  if (o.zero !== false) { lo = Math.min(lo, 0); hi = Math.max(hi, 0); }
+  if (hi === lo) hi = lo + 1;
+  const x = (i) => pl + (W - pl - pr) * i / (v.length - 1), y = (a) => pt + (H - pt - pb) * (1 - (a - lo) / (hi - lo));
+  let g = "";
+  for (let k = 0; k <= 3; k++) {
+    const a = lo + (hi - lo) * k / 3, yy = y(a).toFixed(1);
+    g += `<line x1="${pl}" x2="${W - pr}" y1="${yy}" y2="${yy}" stroke="#1c1c1c"/><text x="${pl - 4}" y="${(+yy + 3).toFixed(1)}" text-anchor="end">${esc(fmt(a))}</text>`;
+  }
+  if (lo < 0 && hi > 0) g += `<line x1="${pl}" x2="${W - pr}" y1="${y(0).toFixed(1)}" y2="${y(0).toFixed(1)}" stroke="#555" stroke-dasharray="3 3"/>`;
+  const col = o.color || (v[v.length - 1] >= 0 ? "var(--up)" : "var(--dn)");
+  const pts = v.map((a, i) => `${x(i).toFixed(1)},${y(a).toFixed(1)}`).join(" ");
+  g += `<polyline points="${pts}" fill="none" stroke="${col}" stroke-width="1.5"/>`;
+  g += `<text x="${pl}" y="${H - 3}">${esc(o.x0 || "1")}</text><text x="${W - pr}" y="${H - 3}" text-anchor="end">${esc(o.x1 || v.length)}</text>`;
+  return `<svg class="chart" viewBox="0 0 ${W} ${H}">${g}</svg>`;
+}
+function barChart(vals, labels, o = {}) {
+  if (!vals || !vals.length || vals.every((a) => !a)) return `<div class="pad dim">NO DATA YET</div>`;
+  const W = 640, H = o.h || 120, pl = 40, pr = 6, pt = 8, pb = 18, n = vals.length;
+  const lo = Math.min(0, ...vals.map((a) => a || 0)), hi = Math.max(0, ...vals.map((a) => a || 0)), d = (hi - lo) || 1;
+  const bw = (W - pl - pr) / n, y = (a) => pt + (H - pt - pb) * (1 - (a - lo) / d), fmt = o.fmt || ((a) => String(Math.round(a)));
+  let g = "";
+  for (let k = 0; k <= 2; k++) { const a = lo + d * k / 2; g += `<line x1="${pl}" x2="${W - pr}" y1="${y(a).toFixed(1)}" y2="${y(a).toFixed(1)}" stroke="#1c1c1c"/><text x="${pl - 4}" y="${(y(a) + 3).toFixed(1)}" text-anchor="end">${esc(fmt(a))}</text>`; }
+  vals.forEach((a, i) => {
+    if (nul(a)) return;
+    const c = o.color ? o.color(a, i) : (a >= 0 ? "var(--up)" : "var(--dn)"), y0 = y(0), y1 = y(a);
+    g += `<rect x="${(pl + i * bw + 1).toFixed(1)}" y="${Math.min(y0, y1).toFixed(1)}" width="${Math.max(1, bw - 2).toFixed(1)}" height="${Math.max(1, Math.abs(y1 - y0)).toFixed(1)}" fill="${c}"/>`;
+  });
+  const every = Math.max(1, Math.ceil(n / (o.maxLabels || 8)));
+  (labels || []).forEach((t, i) => { if (i % every === 0) g += `<text x="${(pl + i * bw + bw / 2).toFixed(1)}" y="${H - 4}" text-anchor="middle">${esc(t)}</text>`; });
+  return `<svg class="chart" viewBox="0 0 ${W} ${H}">${g}</svg>`;
+}
+const panel = (title, meta, body, cls = "") => `<div class="panel ${cls}"><div class="ph"><span>${esc(title)}</span><i>${meta || ""}</i></div><div class="pb">${body}</div></div>`;
+const kv = (rows) => `<div class="kv">${rows.map((r) => `<div>${esc(r[0])}</div><div>${r[1]}</div>`).join("")}</div>`;
+const kv2 = (rows) => `<div class="kv2">${rows.map((r) => `<div><span>${esc(r[0])}</span><span>${r[1]}</span></div>`).join("")}</div>`;
+const meter = (a, b) => `<div class="bar"><i style="width:${Math.max(0, Math.min(100, a / b * 100)).toFixed(1)}%"></i></div>`;
+
+/* ---------- state + data ---------- */
+const S = {view: "DASH", ov: null, var: null, varId: null, mkt: null, pos: null, sys: null, sort: {k: "lo90", dir: -1}, ok: false, last: 0, err: ""};
+async function api(path) {
+  const r = await fetch(path, {headers: {"X-Init-Data": INIT}, cache: "no-store"});
+  if (r.status === 401) throw new Error("ACCESS DENIED. This console answers only to the owner, from inside Telegram.");
+  if (!r.ok) throw new Error("HTTP " + r.status);
+  return r.json();
+}
+async function load(what, force) {
+  try {
+    if (what === "ov") S.ov = await api("/terminal/api/overview");
+    if (what === "var" && S.varId) S.var = await api("/terminal/api/variant?id=" + encodeURIComponent(S.varId));
+    if (what === "mkt") S.mkt = await api("/terminal/api/market");
+    if (what === "pos") S.pos = await api("/terminal/api/positions");
+    if (what === "sys") S.sys = await api("/terminal/api/system");
+    S.ok = true; S.last = Date.now(); S.err = "";
+  } catch (e) { S.ok = false; S.err = e.message || String(e); }
+}
+async function refresh() {
+  await load("ov");
+  const v = S.view;
+  if (v === "VAR") await load("var"); else if (v === "MKT") await load("mkt");
+  else if (v === "POS") await load("pos"); else if (v === "SYS") await load("sys");
+  render();
+}
+
+/* ---------- views ---------- */
+const COLS = [
+  {k: "name", l: "VARIANT", cls: "l"}, {k: "status", l: "STATE", cls: "l"}, {k: "n", l: "N", f: (r) => num(r.n)},
+  {k: "mean", l: "MEAN", f: (r) => C(r.mean, pct(r.mean))}, {k: "median", l: "MED", f: (r) => C(r.median, pct(r.median, 0))},
+  {k: "win", l: "WIN", f: (r) => pctU(r.win, 0)}, {k: "pf", l: "PF", f: (r) => nul(r.pf) ? "—" : r.pf.toFixed(2)},
+  {k: "lo_adj", l: "LO.ADJ", f: (r) => C(r.lo_adj, pct(r.lo_adj))}, {k: "lo90", l: "LO90", f: (r) => C(r.lo90, pct(r.lo90))},
+  {k: "hi95", l: "HI95", f: (r) => C(r.hi95, pct(r.hi95))}, {k: "maxdd", l: "MAXDD", f: (r) => nul(r.maxdd) ? "—" : r.maxdd.toFixed(1)},
+  {k: "top3", l: "EX-TOP3", f: (r) => C(r.top3, pct(r.top3))}, {k: "h1", l: "H1", f: (r) => C(r.h1, pct(r.h1, 0))},
+  {k: "h2", l: "H2", f: (r) => C(r.h2, pct(r.h2, 0))}, {k: "l10", l: "@10S", f: (r) => C(r.l10, pct(r.l10))},
+  {k: "l20", l: "@20S", f: (r) => C(r.l20, pct(r.l20))}, {k: "ok", l: "CHK", f: (r) => r.n ? `<span class="${r.ok === r.of ? "up" : r.ok >= r.of - 1 ? "am" : "dim"}">${r.ok}/${r.of}</span>` : "—"},
+  {k: "spark", l: "EQUITY", f: (r) => spark(r.spark), nosort: true},
+];
+function sorted(rows) {
+  const {k, dir} = S.sort;
+  return rows.slice().sort((a, b) => {
+    const x = a[k], y = b[k];
+    if (typeof x === "string" || typeof y === "string") return dir * String(x).localeCompare(String(y)) * -1;
+    return dir * ((nul(x) ? -1e9 : x) - (nul(y) ? -1e9 : y));
+  });
+}
+function boardTable(rows, cols) {
+  const head = cols.map((c) => `<th class="${c.cls || ""} ${S.sort.k === c.k ? "on" : ""}" ${c.nosort ? "" : `data-sort="${c.k}"`}>${c.l}${S.sort.k === c.k ? (S.sort.dir < 0 ? " v" : " ^") : ""}</th>`).join("");
+  const body = rows.map((r) => `<tr class="row ${S.varId === r.id ? "sel" : ""}" data-var="${esc(r.id)}">` + cols.map((c) => {
+    if (c.k === "name") return `<td class="l ${r.status === "RETIRED" ? "dim" : "am"}">${esc(r.name)}</td>`;
+    if (c.k === "status") return `<td class="l">${tagS(r.status)}</td>`;
+    return `<td>${c.f(r)}</td>`;
+  }).join("") + "</tr>").join("");
+  return `<div class="scroll"><table><tr>${head}</tr>${body}</table></div>`;
+}
+function verdictBox(o) {
+  const L = o.lab, best = Math.max(0, ...o.board.map((b) => b.n)), pass = L.passed.length;
+  const posLo = o.board.filter((b) => b.n >= 150 && (b.lo_adj || -9) > 0).length;
+  let cls = "bad", msg;
+  if (pass) { cls = "good"; msg = `${pass} VARIANT(S) CLEARED THE PAPER CHECKLIST: ${L.passed.map(esc).join(", ")}. NOT PROOF. NEXT STEP IS TINY LIVE, 100+ TRADES, COMPARE FILLS.`; }
+  else if (L.confirming.length) { cls = ""; msg = `CONFIRMING: ${L.confirming.map(esc).join(", ")}. MUST HOLD AFTER ${150} MORE TRADES.`; }
+  else msg = `NO VARIANT HAS CLEARED THE CHECKLIST. NOTHING HERE JUSTIFIES REAL MONEY.`;
+  return `<div class="hl ${cls}"><div class="b">${msg}</div><div class="dim" style="margin-top:3px">LARGEST SAMPLE ${num(best)}/${L.min_trades} TRADES · ${posLo} VARIANT(S) WITH n&ge;150 AND CORRECTED LOWER BOUND &gt; 0 · ${L.variants_ever} VARIANTS EVER TESTED (EACH ONE RAISES THE BAR)</div><div style="margin-top:5px">${meter(best, L.min_trades)}</div></div>`;
+}
+function vDash() {
+  const o = S.ov; if (!o) return `<div class="pad dim">LOADING...</div>`;
+  const L = o.lab, A = o.apex, R = o.risk, hours = Math.max(0.1, o.uptime / 3600);
+  const top = sorted(o.board.filter((b) => b.status !== "RETIRED")).slice(0, 9);
+  const cols = COLS.filter((c) => ["name", "status", "n", "mean", "lo_adj", "ok", "spark"].includes(c.k));
+  const feed = kv([
+    ["LAUNCHES SEEN", num(L.launches)], ["ADMITTED", num(L.admitted)], ["SETTLED", num(L.settled)],
+    ["DROPPED AS DEAD", num(L.dead)], ["DEAD SHARE", pctU(L.admitted ? L.dead / L.admitted : null, 1)],
+    ["FORWARD TRADES", num(L.fwd_trades)], ["TRACKING NOW", `${L.tracking} / ${L.max_active}`],
+    ["HELIUS CALLS TODAY", `${num(L.calls_today)} / ${num(L.daily_calls)}`], ["LAST EVALUATION", L.last_eval ? age(o.now - L.last_eval) + " ago" : "—"]]);
+  const apx = kv([
+    ["SOL/USD", A.sol_usd ? "$" + A.sol_usd.toFixed(2) : "—"], ["CREDITS MONTH", `${num(A.credits_month)} / ${num(A.credit_ceiling)}`],
+    ["CREDITS TODAY", num(A.credits_today)], ["WEBHOOK AGE", age(A.webhook_age)], ["EVENTS", num(A.events)],
+    ["IDLE SKIPS", num(A.idle_skips)], ["LIVE ENTRIES", num(A.entries)], ["FLOW / SCALP SCORE", `${A.flow_score} / ${A.scalp_score}`]]) + `<div style="margin-top:4px">${meter(A.credits_month, A.credit_ceiling)}</div>`;
+  const risk = R ? kv([
+    ["STATE", R.halted ? `<span class="dn b">HALTED</span>` : `<span class="up">OK</span>`],
+    ["ROLLING MEAN", `${C(R.rolling_mean, pct(R.rolling_mean))} <span class="dim">(${R.n}/${R.window}, floor ${pct(R.floor, 0)})</span>`],
+    ["TODAY NET LOSS", `${R.day_loss.toFixed(3)} / ${R.cap} SOL`]]) : `<div class="dim">NO OWNER RISK DATA</div>`;
+  const rej = A.rejects.length ? kv(A.rejects.map((r) => [r[0], num(r[1])])) : `<div class="dim">NONE YET</div>`;
+  return verdictBox(o) + `<div class="grid">` +
+    panel("Leaderboard", `top by LO90 · tap a row`, boardTable(top, cols), "span2") +
+    panel("Lab feed", `since boot ${age(o.uptime)}`, feed) + panel("Apex engine", "", apx) +
+    panel("Risk (owner, live)", "", risk) + panel("Live-pipeline rejects", "top 14", rej) + `</div>`;
+}
+function vLab() {
+  const o = S.ov; if (!o) return `<div class="pad dim">LOADING...</div>`;
+  return verdictBox(o) + panel("All variants", `${o.board.length} registered · click a header to sort · tap a row`, boardTable(sorted(o.board), COLS));
+}
+function vVar() {
+  const d = S.var;
+  if (!S.varId) return `<div class="pad dim">PICK A VARIANT: type VAR &lt;name&gt; or tap a row in LAB.</div>`;
+  if (!d) return `<div class="pad dim">LOADING ${esc(S.varId)}...</div>`;
+  const v = d.v, s = d.s, n = s.n || 0, fl = (o, p = "") => Object.entries(o || {}).map(([k, x]) => [p + k, typeof x === "object" ? esc(JSON.stringify(x)) : esc(x)]);
+  const head = panel("Variant", tagS(v.status), kv([["NAME", `<span class="am b">${esc(v.name)}</span>`], ["ID", esc(v.id)], ["FAMILY", esc(v.family)],
+    ["ORIGIN", esc(v.origin) + (v.parent ? " of " + esc(v.parent.split(".")[0]) : "")], ["AGE", age(Date.now() / 1000 - v.registered)],
+    ["FORWARD TRADES", `${num(n)} / ${d.min_trades}`]]) + `<div style="margin-top:4px">${meter(n, d.min_trades)}</div>`);
+  const params = panel("Parameters", "immutable", kv([...fl(v.params.entry, "entry."), ...fl(v.params.exit, "exit.")]));
+  const stats = n ? panel("Statistics", "per trade, in stakes", kv2([
+    ["MEAN", C(s.mean, pct(s.mean, 2))], ["MEDIAN", C(s.median, pct(s.median, 1))], ["WIN RATE", pctU(s.win, 1)],
+    ["AVG WIN", C(1, pct(s.avg_win, 1))], ["AVG LOSS", C(-1, pct(s.avg_loss, 1))], ["PROFIT FACTOR", nul(s.pf) ? "—" : s.pf.toFixed(2)],
+    ["STDEV", nul(d.stdev) ? "—" : pctU(d.stdev, 0)], ["SUM (STAKES)", C(s.total, (s.total >= 0 ? "+" : "") + s.total.toFixed(2))],
+    ["LO ADJ (BONF.)", C(s.lo_adj, pct(s.lo_adj, 2))], ["LO 90", C(s.lo90, pct(s.lo90, 2))], ["LO 95", C(s.lo95, pct(s.lo95, 2))],
+    ["HI 95", C(s.hi95, pct(s.hi95, 2))], ["MAX DRAWDOWN", nul(s.maxdd) ? "—" : s.maxdd.toFixed(2) + " stakes"],
+    ["EX TOP-3 MEAN", C(s.top3_mean, pct(s.top3_mean, 2))], ["1ST HALF", C(s.h1, pct(s.h1, 1))], ["2ND HALF", C(s.h2, pct(s.h2, 1))],
+    ["K (TESTS)", s.k_total], ["P05 / P50 / P95", ["5", "50", "95"].map((q) => nul(d.quantiles[q]) ? "—" : pct(d.quantiles[q], 0)).join(" / ")]])) : panel("Statistics", "", `<div class="pad dim">NO FORWARD TRADES YET</div>`);
+  const chk = d.checklist.length ? panel("Promotion checklist", "all six, then 150 more trades",
+    `<div class="chk">${d.checklist.map((c) => `<div class="${c.ok ? "up" : "dn"} b">${c.ok ? "PASS" : "FAIL"}</div><div>${esc(c.t)}</div>`).join("")}</div>`) : "";
+  const eq = panel("Equity curve", "cumulative return, in stakes", lineChart(d.equity, {fmt: (a) => (a >= 0 ? "+" : "") + a.toFixed(1), x0: "trade 1", x1: "trade " + n}));
+  const ro = panel("Rolling mean, 50 trades", "edge over time", lineChart(d.rolling, {fmt: (a) => pct(a, 0), x0: "", x1: "now"}));
+  const hl = d.hist.map((_, i) => d.hist_lo + i * d.hist_step);
+  const hist = panel("Return distribution", `bins ${pct(d.hist_step, 1)} wide · last bin = overflow`, barChart(d.hist, hl.map((a, i) => i === d.hist.length - 1 ? ">" + pct(a, 0) : pct(a, 0)), {color: (a, i) => hl[i] >= 0 ? "var(--up)" : "var(--dn)", maxLabels: 6}));
+  const lat = panel("Latency sensitivity", "mean return by execution delay", barChart(d.latency.map((x) => x.m), d.latency.map((x) => x.s + "s"), {fmt: (a) => pct(a, 0), maxLabels: 4}));
+  const ex = panel("Exit reasons", "", `<table><tr><th class="l">REASON</th><th>N</th><th>SHARE</th><th>MEAN</th></tr>${d.exits.map((e) => `<tr><td class="l">${esc(e.reason)}</td><td>${num(e.n)}</td><td>${pctU(e.n / n, 0)}</td><td>${C(e.mean, pct(e.mean))}</td></tr>`).join("")}</table>`);
+  const cv = d.curve.length ? panel("Curve type", "v0 split", `<table><tr><th class="l">TYPE</th><th>N</th><th>MEAN</th></tr>${d.curve.map((e) => `<tr><td class="l">${esc(e.k)}</td><td>${num(e.n)}</td><td>${C(e.m, pct(e.m))}</td></tr>`).join("")}</table>`) : "";
+  const tail = panel("Last 30 trades", "newest first", `<div class="scroll"><table><tr><th class="l">TIME</th><th>AGE</th><th>RET</th><th>PEAK</th><th>HOLD</th><th class="l">EXIT</th></tr>${d.tail.map((t) => `<tr><td class="l dim">${new Date(t.decision_ts * 1000).toISOString().slice(5, 16).replace("T", " ")}</td><td>${Math.round(t.entry_age)}s</td><td>${C(t.ret, pct(t.ret))}</td><td>${nul(t.peak_ratio) ? "—" : t.peak_ratio.toFixed(2) + "x"}</td><td>${Math.round(t.hold_s)}s</td><td class="l">${esc(t.exit_reason)}</td></tr>`).join("")}</table></div>`, "span2");
+  return `<div class="grid">${head}${params}${stats}${chk}${eq}${ro}${hist}${lat}${ex}${cv}${tail}</div>`;
+}
+function vMkt() {
+  const m = S.mkt; if (!m) return `<div class="pad dim">LOADING...</div>`;
+  const hh = (t) => new Date(t * 1000).toISOString().slice(11, 13);
+  const launches = panel("Settled coins per hour", "last 72h, UTC", barChart(m.hourly.map((h) => h.n), m.hourly.map((h) => hh(h.h)), {color: () => "var(--amber)", maxLabels: 12}));
+  const p2 = panel("Share of coins that reached 2x", "per hour", barChart(m.hourly.map((h) => h.p2), m.hourly.map((h) => hh(h.h)), {fmt: (a) => pctU(a, 0), color: () => "var(--cy)", maxLabels: 12}));
+  const pd = panel("Best price reached, last 24h", `${num(m.peaks_n)} coins · what the market offered`, barChart(m.peak_dist.map((x) => x.n), m.peak_dist.map((x) => x.k), {color: () => "var(--amber)", maxLabels: 6}) + `<table style="margin-top:4px"><tr><th class="l">PEAK</th><th>COINS</th><th>SHARE</th></tr>${m.peak_dist.map((x) => `<tr><td class="l">${esc(x.k)}</td><td>${num(x.n)}</td><td>${pctU(m.peaks_n ? x.n / m.peaks_n : null, 1)}</td></tr>`).join("")}</table>`);
+  const cr = m.ctrl.CTRL_RANDOM, al = m.ctrl.ALL_T60;
+  const reg = panel("Regime: random-entry control, mean by hour", "is the market tradable right now?", cr ? barChart(cr.hourly.map((h) => h.m), cr.hourly.map((h) => hh(h.h)), {fmt: (a) => pct(a, 0), maxLabels: 12}) : `<div class="pad dim">NO DATA</div>`);
+  const reg2 = panel("Regime: enter-every-coin baseline, mean by hour", "", al ? barChart(al.hourly.map((h) => h.m), al.hourly.map((h) => hh(h.h)), {fmt: (a) => pct(a, 0), maxLabels: 12}) : `<div class="pad dim">NO DATA</div>`);
+  const tod = panel("Time of day (UTC): control mean return", "all forward trades · treat as noise until n is large", cr ? barChart(cr.tod.map((h) => h.m), cr.tod.map((h) => String(h.hod).padStart(2, "0")), {fmt: (a) => pct(a, 0), maxLabels: 12}) + `<div class="dim" style="margin-top:3px">N per hour: ${cr.tod.map((h) => h.n).join(" ")}</div>` : `<div class="pad dim">NO DATA</div>`);
+  const dl = panel("Daily Lab totals", "", `<div class="scroll"><table><tr><th class="l">DAY</th><th>LAUNCHES</th><th>ADMITTED</th><th>DEAD</th><th>SETTLED</th><th>CALLS</th><th>DROPPED</th></tr>${m.daily.slice().reverse().map((d) => `<tr><td class="l">${esc(d.day)}</td><td>${num(d.launches)}</td><td>${num(d.admitted)}</td><td>${num(d.dead)}</td><td>${num(d.settled)}</td><td>${num(d.calls)}</td><td>${num(d.dropped)}</td></tr>`).join("")}</table></div>`, "span2");
+  return `<div class="grid">${launches}${p2}${pd}${reg}${reg2}${tod}${dl}</div>`;
+}
+function posTable(rows) {
+  if (!rows.length) return `<div class="pad dim">NONE</div>`;
+  return `<div class="scroll"><table><tr><th class="l">NAME</th><th class="l">MODE</th><th class="l">PROF</th><th>SIZE</th><th>NOW</th><th>PEAK</th><th>AGE</th></tr>${rows.map((p) => `<tr><td class="l am">${esc((p.name || p.symbol || "?").slice(0, 16))}</td><td class="l">${esc(p.mode)}</td><td class="l">${esc(p.profile)}</td><td>${p.entry_sol.toFixed(3)}</td><td>${C((p.last_ratio || 1) - 1, nul(p.last_ratio) ? "—" : pct(p.last_ratio - 1, 1))}</td><td>${nul(p.peak_ratio) ? "—" : p.peak_ratio.toFixed(2) + "x"}</td><td>${age(S.pos.now - p.entry_ts)}</td></tr>`).join("")}</table></div>`;
+}
+function modeBox(label, m) {
+  if (!m || !m.n) return panel(label, "", `<div class="pad dim">NO CLOSED TRADES</div>`);
+  return panel(label, `${m.n} closed`, kv2([["WIN RATE", pctU(m.win, 1)], ["NET P&L (SOL)", C(m.pnl, sol(m.pnl))], ["MEAN / TRADE", C(m.mean_ret, pct(m.mean_ret))],
+    ["AVG WIN (SOL)", C(1, sol(m.avg_win))], ["AVG LOSS (SOL)", C(-1, sol(m.avg_loss))], ["PROFIT FACTOR", nul(m.pf) ? "—" : m.pf.toFixed(2)]]) +
+    lineChart(m.equity, {h: 110, fmt: (a) => sol(a, 2), x0: "", x1: "now"}) +
+    `<table style="margin-top:4px"><tr><th class="l">EXIT</th><th>N</th><th>MEAN</th></tr>${m.exits.map((e) => `<tr><td class="l">${esc(e.reason)}</td><td>${e.n}</td><td>${C(e.mean, pct(e.mean, 0))}</td></tr>`).join("")}</table>`);
+}
+function vPos() {
+  const p = S.pos; if (!p) return `<div class="pad dim">LOADING...</div>`;
+  const R = p.risk;
+  const risk = panel("Risk", "owner, live only", R ? kv([["STATE", R.halted ? `<span class="dn b">HALTED</span>` : `<span class="up">OK</span>`],
+    ["ROLLING MEAN", `${C(R.rolling_mean, pct(R.rolling_mean))} <span class="dim">(${R.n}/${R.window}, floor ${pct(R.floor, 0)})</span>`],
+    ["TODAY NET LOSS", `${R.day_loss.toFixed(3)} / ${R.cap} SOL`]]) : `<div class="dim">—</div>`);
+  const slip = panel("Real fills vs decision price", "bps, negative = worse than decided", p.slippage.length ? `<table><tr><th class="l">KIND</th><th>N</th><th>MEAN</th><th>MED</th><th>P10</th><th>P90</th></tr>${p.slippage.map((s) => `<tr><td class="l">${esc(s.k)}</td><td>${s.n}</td><td>${C(s.mean, Math.round(s.mean))}</td><td>${Math.round(s.median)}</td><td>${Math.round(s.p10)}</td><td>${Math.round(s.p90)}</td></tr>`).join("")}</table>` : `<div class="pad dim">NO LIVE FILLS LOGGED YET</div>`);
+  const closed = panel("Last closed trades", "newest first", `<div class="scroll"><table><tr><th class="l">NAME</th><th class="l">MODE</th><th class="l">EXIT</th><th>P&amp;L SOL</th><th>PEAK</th></tr>${p.closed.slice().reverse().slice(0, 40).map((c) => `<tr><td class="l am">${esc((c.name || "?").slice(0, 14))}</td><td class="l">${esc(c.mode)}</td><td class="l">${esc(c.exit_reason)}</td><td>${C(c.pnl, sol(c.pnl))}</td><td>${nul(c.peak_ratio) ? "—" : c.peak_ratio.toFixed(2) + "x"}</td></tr>`).join("")}</table></div>`, "span2");
+  return `<div class="grid">${risk}${slip}${panel("Open positions", p.open.length, posTable(p.open), "span2")}${modeBox("Live book", p.live)}${modeBox("Paper book", p.paper)}${closed}</div>`;
+}
+function vSys() {
+  const s = S.sys; if (!s) return `<div class="pad dim">LOADING...</div>`;
+  const cfg = s.config.map((g) => panel("Config / " + g.group, "", kv(g.items.map((i) => [i.k, esc(Array.isArray(i.v) ? i.v.join(", ") : i.v)]))));
+  const prof = panel("Exit profiles", "stop and trail are price ratios", `<table><tr><th class="l">KEY</th><th class="l">NAME</th><th>STOP</th><th>TRAIL</th><th class="l">TIERS</th></tr>${Object.entries(s.profiles).map(([k, p]) => `<tr><td class="l am">${k}</td><td class="l">${esc(p.name)}</td><td>${p.stop}</td><td>${p.trail == null ? "—" : p.trail}</td><td class="l">${p.tiers.map((t) => t[0] + "x:" + Math.round(t[1] * 100) + "%").join(" ")}</td></tr>`).join("")}</table>`, "span2");
+  const sys = panel("System", "", kv([["COMMIT", esc(s.env.commit || "—")], ["UPTIME", age(s.uptime)], ["DATABASE", (s.db_bytes / 1048576).toFixed(1) + " MB"],
+    ["LAB CANDIDATES", num(s.lab_candidates)], ["LAB TRADES", num(s.lab_trades)], ["BLACKLISTED MINTS", num(s.blacklist)],
+    ["NATIVE SELL", s.env.native_tx ? `<span class="am">ON</span>` : "OFF"], ["AUTO-TUNERS", s.env.auto_tuner ? "ON" : "FROZEN"], ["LAB", s.env.lab ? "ON" : "OFF"]]));
+  return `<div class="grid">${sys}${cfg.join("")}${prof}</div>`;
+}
+function vHelp() {
+  return `<div class="grid">${panel("Commands", "", kv([["DASH  F1", "overview"], ["LAB  F2", "all variants, sortable"], ["VAR &lt;name&gt;  F3", "one variant in depth"], ["MKT  F4", "market and regime"],
+    ["POS  F5", "positions, fills, risk"], ["SYS  F6", "config and system"], ["HELP  F7", "this screen"], ["R", "refresh now"], ["SORT &lt;col&gt;", "mean lo90 lo_adj n maxdd ..."]]))}
+  ${panel("How to read it", "", `<div style="line-height:1.5">
+   <div><span class="am">MEAN</span> average return per paper trade, as a fraction of the stake.</div>
+   <div><span class="am">LO.ADJ</span> lower confidence bound after correcting for every variant ever tried. Must be above zero.</div>
+   <div><span class="am">EX-TOP3</span> mean with the three best trades removed. One lucky trade must not carry a variant.</div>
+   <div><span class="am">H1 / H2</span> first and second half of the sample. Both must be positive.</div>
+   <div><span class="am">@10S / @20S</span> mean if execution is 10 or 20 seconds slow. Real fills will be slower than paper.</div>
+   <div><span class="am">CHK</span> checklist items passed out of six. PASSED also needs 150 more trades afterwards.</div>
+   <div class="dim" style="margin-top:6px">Paper results are optimistic: no failed transactions, no sandwiching, no congestion. A pass means "worth a tiny live test", never "profitable".</div></div>`)}</div>`;
+}
+const VIEWS = {DASH: vDash, LAB: vLab, VAR: vVar, MKT: vMkt, POS: vPos, SYS: vSys, HELP: vHelp};
+const KEYS = [["F1", "DASH"], ["F2", "LAB"], ["F3", "VAR"], ["F4", "MKT"], ["F5", "POS"], ["F6", "SYS"], ["F7", "HELP"]];
+
+/* ---------- shell ---------- */
+function ticker() {
+  const o = S.ov; if (!o) { $("#tick").innerHTML = `<div class="dim">NO DATA</div>`; return; }
+  const L = o.lab, R = o.risk;
+  const items = [["TRACK", L.tracking], ["LAUNCHES", num(L.launches)], ["FWD TRADES", num(L.fwd_trades)], ["VARIANTS", `${L.variants_active}/${L.variants_ever}`],
+    ["PASSED", `<span class="${L.passed.length ? "up" : "dim"}">${L.passed.length}</span>`], ["SOL", o.apex.sol_usd ? "$" + o.apex.sol_usd.toFixed(2) : "—"],
+    ["RISK", R ? (R.halted ? `<span class="dn">HALT</span>` : `<span class="up">OK</span>`) : "—"], ["NATIVE", o.flags.native_tx ? "ON" : "OFF"], ["BUILD", esc(o.flags.commit || "—")]];
+  $("#tick").innerHTML = items.map((i) => `<div><b>${i[0]}</b>${i[1]}</div>`).join("");
+}
+function linkStatus() {
+  const l = $("#link");
+  if (S.ok) { const a = (Date.now() - S.last) / 1000; l.innerHTML = `<span class="up">LIVE</span> <span class="dim">${Math.round(a)}s</span>`; }
+  else { l.innerHTML = `<span class="dn">NO LINK</span>`; }
+}
+function render() {
+  ticker();
+  linkStatus();
+  $("#keys").innerHTML = KEYS.map(([k, v]) => `<button data-v="${v}" class="${S.view === v ? "on" : ""}"><b>${k}</b>${v}</button>`).join("");
+  const main = $("#main"), top = main.scrollTop;
+  if (S.err && !S.ov) main.innerHTML = `<div class="err">${esc(S.err)}</div>`;
+  else main.innerHTML = (S.err ? `<div class="hl bad">${esc(S.err)}</div>` : "") + VIEWS[S.view]();
+  main.scrollTop = top;
+}
+function go(v, id) {
+  S.view = v; if (id) { S.varId = id; S.var = null; }
+  $("#main").scrollTop = 0; render(); refresh();
+}
+function command(txt) {
+  const t = txt.trim().toUpperCase(); if (!t) return;
+  const [w, ...rest] = t.split(/\s+/), arg = rest.join(" ");
+  if (VIEWS[w] && w !== "VAR") return go(w);
+  if (w === "R") return refresh();
+  if (w === "SORT") { const k = arg.toLowerCase(); if (COLS.some((c) => c.k === k)) { S.sort = {k, dir: S.sort.k === k ? -S.sort.dir : -1}; go("LAB"); } return; }
+  const q = (w === "VAR" || w === "V" ? arg : t).toLowerCase();
+  const rows = (S.ov && S.ov.board) || [];
+  const hit = rows.find((r) => r.name.toLowerCase() === q) || rows.find((r) => r.name.toLowerCase().includes(q));
+  if (hit) go("VAR", hit.id);
+}
+document.addEventListener("click", (e) => {
+  const t = e.target.closest("[data-v],[data-var],[data-sort]"); if (!t) return;
+  if (t.dataset.v) go(t.dataset.v);
+  else if (t.dataset.var) go("VAR", t.dataset.var);
+  else if (t.dataset.sort) { const k = t.dataset.sort; S.sort = {k, dir: S.sort.k === k ? -S.sort.dir : -1}; render(); }
+});
+$("#cmdin").addEventListener("keydown", (e) => { if (e.key === "Enter") { command(e.target.value); e.target.value = ""; e.target.blur(); } });
+document.addEventListener("keydown", (e) => {
+  if (e.target.tagName === "INPUT") return;
+  const k = KEYS.find(([f]) => f === e.key); if (k) { e.preventDefault(); go(k[1]); }
+  else if (e.key === "/" || e.key === ":") { e.preventDefault(); $("#cmdin").focus(); }
+});
+setInterval(() => { const d = new Date(); $("#clock").textContent = d.toISOString().slice(11, 19) + "Z"; linkStatus(); }, 1000);
+setInterval(refresh, 12000);
+if (!INIT) { S.err = "NO TELEGRAM SESSION. Open this from the TERMINAL button in the CLEX bot."; render(); }
+else refresh();
+</script>
+</body>
+</html>

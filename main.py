@@ -47,6 +47,7 @@ import apex
 import access
 import admin_data
 import lab
+import terminal
 import vault
 
 # ── ENV ───────────────────────────────────────────────────────────────────────
@@ -1179,6 +1180,10 @@ async def lifespan(app: FastAPI):
     except Exception as e:      # the lab must never stop the bot from booting
         logger.error(f"lab startup failed: {e}", exc_info=True)
     await access.startup(bot)
+    try:
+        await terminal.install_menu(bot)
+    except Exception as e:      # the console is optional: never block boot
+        logger.warning(f"terminal menu button not set: {e}")
     await vault.startup()
     await bot.delete_webhook(drop_pending_updates=True)
 
@@ -1210,6 +1215,7 @@ async def lifespan(app: FastAPI):
         pass
 
 app = FastAPI(lifespan=lifespan)
+app.include_router(terminal.router)   # owner-only research console (Telegram Mini App)
 
 @app.post("/webhook")
 async def webhook(req: Request):

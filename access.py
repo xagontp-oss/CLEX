@@ -31,7 +31,7 @@ from aiogram import BaseMiddleware, F, Router
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, InlineKeyboardButton, Message, WebAppInfo
 
 import apex
 
@@ -343,9 +343,14 @@ async def _admin_home():
             f"<code>Open pos. </code>{open_pos}\n"
             f"<code>Invites   </code>{len(pending_invites())} pending\n"
             f"{RULE}\n<i>Only you can see this panel.</i>")
-    return text, _kb([[("👥 Users", "adm:users:0"), ("➕ New invite link", "adm:inv")],
-                      [("🔗 Pending invites", "adm:invs"), ("🗄 Data", "adm:data")],
-                      [("🧪 Lab", "lab:home")], [("‹ Home", "ax:home")]])
+    kb = _kb([[("👥 Users", "adm:users:0"), ("➕ New invite link", "adm:inv")],
+              [("🔗 Pending invites", "adm:invs"), ("🗄 Data", "adm:data")],
+              [("🧪 Lab", "lab:home")], [("‹ Home", "ax:home")]])
+    url = os.getenv("TERMINAL_URL", "") or (
+        f"https://{os.getenv('RAILWAY_PUBLIC_DOMAIN')}/terminal" if os.getenv("RAILWAY_PUBLIC_DOMAIN") else "")
+    if url:                                                    # the research console, as a Telegram Mini App
+        kb.inline_keyboard.insert(0, [InlineKeyboardButton(text="🖥 TERMINAL", web_app=WebAppInfo(url=url))])
+    return text, kb
 
 
 @router.message(Command("admin"))
