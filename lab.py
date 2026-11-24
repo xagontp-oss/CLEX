@@ -479,7 +479,7 @@ def compute_stats(rows: List[Dict], k_total: int, seed: int = 1) -> Dict:
     s["exits"] = {k: [len(v), sum(v) / len(v)] for k, v in ex.items()}
     buckets: Dict[str, List[float]] = {}
     for r in rows:
-        buckets.setdefault("classic (v0>=10)" if (r.get("v0") or 0) >= 10 else "low-start (v0<10)", []).append(r["ret"])
+        buckets.setdefault("classic (v0 10 or more)" if (r.get("v0") or 0) >= 10 else "low-start (v0 under 10)", []).append(r["ret"])
     s["curve"] = {k: [len(v), sum(v) / len(v)] for k, v in buckets.items()}
     return s
 
@@ -1295,7 +1295,7 @@ async def variant_page(rid: int) -> Tuple[str, "apex.InlineKeyboardMarkup"]:
             lines.append(f"<code>{html.escape(k)[:16]:16s}</code> n={n_} {_pct(m_, 0)}")
         lines.append("<b>Curve type</b>")
         for k, (n_, m_) in s["curve"].items():
-            lines.append(f"<code>{k:18s}</code> n={n_} {_pct(m_, 0)}")
+            lines.append(f"<code>{html.escape(k):18s}</code> n={n_} {_pct(m_, 0)}")
         lines += [RULE, "<b>Promotion checklist</b>"] + [("✅ " if ok else "❌ ") + t for t, ok in criteria(s)]
     else:
         lines.append("No forward trades yet.")
