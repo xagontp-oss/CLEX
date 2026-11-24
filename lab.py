@@ -351,11 +351,14 @@ def _scalp_ok(e: Dict, cand: Cand, c: Dict) -> bool:
     h = c["holder"]
     if h is None:
         return False
-    if cand.dev_pct0 > apex.SCALP_MAX_DEV or h["top1"] > apex.SCALP_MAX_SINGLE or h["top10"] > apex.SCALP_TOP10:
+    # Gate defaults are FROZEN at the original live Scalp values so SCALP_REPLICA's evidence stays
+    # comparable after the live bot's gates were tightened (SCALP_V2 carries the tightened ones).
+    if (cand.dev_pct0 > e.get("max_dev", 15.0) or h["top1"] > e.get("max_single", 25.0)
+            or h["top10"] > e.get("top10", 60.0)):
         return False
     if cand.dev_pct0 >= 1.0 and h["dev_now"] <= 0.0:
         return False                                          # the dumper already left
-    if h["cluster"] >= apex.SCALP_MAX_CLUSTER or h["buyers"] < apex.SCALP_MIN_BUYERS:
+    if h["cluster"] >= e.get("max_cluster", 6) or h["buyers"] < e.get("min_buyers", 2):
         return False
     r30, rp = c["rate30"], c["rate_prior30"]
     if r30 is None or r30 < e.get("min_rate", apex.SCALP_MOVE_SPEED):
@@ -521,6 +524,11 @@ X_S = {"mode": "verdict", "stop": 0.90, "verdict_secs": 90, "verdict_ratio": 1.0
        "tiers": [[1.5, 0.4], [2.5, 0.3]], "trail_keep": 0.65}
 
 
+# The live Scalp exit after the v2 rebuild: 35%/25% partials, 40% rides a trail 30% below the peak.
+X_S2 = {"mode": "verdict", "stop": 0.90, "verdict_secs": 90, "verdict_ratio": 1.08,
+        "tiers": [[1.5, 0.35], [2.5, 0.25]], "trail_keep": 0.70}
+
+
 def _x(**kw) -> Dict:
     d = copy.deepcopy(X_S)
     d.update(kw)
@@ -570,6 +578,9 @@ SEEDS: List[Tuple[str, Dict]] = [
     ("MOMO20.RUNNER", {"entry": E_MOMO20, "exit": _x(tiers=[])}),
     ("MOMO20.TP50", {"entry": E_MOMO20, "exit": {"mode": "plain", "stop": 0.90, "tiers": [[1.5, 1.0]],
                                                   "time_stop_secs": 300, "time_stop_ratio": 1.0}}),
+    # the live Scalp as rebuilt (tighter holder gates, 1 SOL raised, 3 buyers, new exit)
+    ("SCALP_V2", {"entry": dict(E_SCALP, max_dev=10.0, max_single=20.0, top10=50.0, min_buyers=3,
+                                min_inflow=1.0), "exit": copy.deepcopy(X_S2)}),
 ]
 
 

@@ -89,6 +89,8 @@ async def create(uid: int) -> Dict:
     existing = await get(uid)
     if existing:
         return existing
+    if not await apex.wl_has_phantom(uid):
+        raise PermissionError("connect your own Phantom wallet first")
     from solders.keypair import Keypair
     kp = Keypair()
     async with aiosqlite.connect(DB_PATH, timeout=10) as db:
@@ -201,6 +203,9 @@ async def cb_home(q: CallbackQuery):
 
 @router.callback_query(F.data == "vlt:create")
 async def cb_create(q: CallbackQuery):
+    if not await apex.wl_has_phantom(q.from_user.id):
+        await q.answer("Connect your own Phantom wallet first (Wallet → Connect my Phantom).", show_alert=True)
+        return
     await create(q.from_user.id)
     t, kb = await _home(q.from_user.id)
     await apex._send(q, "✅ <b>Your Fund Collections wallet is ready.</b> Choose a share, then turn it "
