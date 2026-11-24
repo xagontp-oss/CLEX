@@ -63,10 +63,10 @@ async def main():
 
     # ── 3. exit-rule PARITY with the live Scalp profile (fuzz) ──────────────
     rng = random.Random(7)
-    X = lab.X_S
+    X = lab.X_S2
     bad = 0
     for _ in range(20000):
-        ratio = rng.choice([rng.uniform(0.4, 4.5), rng.choice([0.9, 1.08, 1.5, 2.5, 0.65 * 2.0])])
+        ratio = rng.choice([rng.uniform(0.4, 4.5), rng.choice([0.9, 1.08, 1.5, 2.5, 0.70 * 2.0])])
         peak = max(ratio, rng.uniform(0.9, 5.0)) if rng.random() < 0.9 else ratio
         hit = rng.choice([0, 1, 2, 3, 64, 65, 66, 67])
         age = rng.choice([rng.uniform(0, 300), 89.99, 90.0, 90.01])
@@ -185,7 +185,7 @@ async def main():
     assert ls["mean"] > 0 and (ls["top3_mean"] or 0) <= 0 and not all(ok for _, ok in lab.criteria(ls))
     # drawdown cap
     dd = lab.compute_stats(rows_of([0.2] * 300 + [-1.0] * 40 + [0.2] * 400), 20)
-    assert dd["maxdd"] >= 40 and not dict(lab.criteria(dd))[f"max drawdown <= {lab.MAX_DD_STAKES:g} stakes"]
+    assert dd["maxdd"] >= 40 and not dict(lab.criteria(dd))[f"max drawdown at most {lab.MAX_DD_STAKES:g} stakes"]
     # multiple-testing: same data, more variants => a lower (more conservative) bound
     a, b = lab.compute_stats(rows_of([0.05 + rng.gauss(0, 0.3) for _ in range(800)]), 1), None
     b = lab.compute_stats(rows_of([x["ret"] for x in rows_of([0.05 + rng.gauss(0, 0.3) for _ in range(800)])]), 60)
@@ -197,9 +197,9 @@ async def main():
 
     # ── 8. registry: immutable, idempotent, hashed ──────────────────────────
     n1 = await lab.ensure_seeds(); n2 = await lab.ensure_seeds()
-    assert n1 == len(lab.SEEDS) == 20 and n2 == 0
+    assert n1 == len(lab.SEEDS) == 21 and n2 == 0
     vs = await lab.get_variants(False)
-    assert len({v["id"] for v in vs}) == 20 and all(v["id"].endswith(v["hash"]) for v in vs)
+    assert len({v["id"] for v in vs}) == 21 and all(v["id"].endswith(v["hash"]) for v in vs)
     p0 = copy.deepcopy(lab.SEEDS[7][1]); p0["entry"]["min_rate"] = 1.0
     vid, made = await lab.register_variant("MOMO20", p0)
     assert made and vid != next(v["id"] for v in vs if v["name"] == "MOMO20"), "a changed parameter must be a NEW variant"
@@ -388,8 +388,24 @@ async def main():
     rid = (await lab.get_variants(False))[0]["rid"]
     await lab.cb_lab(FQ(f"lab:v:{rid}")); assert "Promotion checklist" in shown[-1][0] or "No forward trades" in shown[-1][0]
     rid2 = next(r for r in [v["rid"] for v in await lab.get_variants(False)] if True)
+    import re as _re
+    def tg_html_ok(t):          # Telegram HTML: only these tags, every '<' must start one, all closed
+        tags = _re.findall(r"<(/?)(b|i|u|s|code|pre|a)(?: [^<>]*)?>", t)
+        stripped = _re.sub(r"<(/?)(b|i|u|s|code|pre|a)(?: [^<>]*)?>", "", t)
+        stack = []
+        for close, name in tags:
+            if close:
+                if not stack or stack.pop() != name: return False
+            else: stack.append(name)
+        return "<" not in stripped and not stack
+    saw_stats = 0
     for v in await lab.get_variants(False):
         txt, _ = await lab.variant_page(v["rid"]); assert len(txt) < 4096
+        assert tg_html_ok(txt), (v["name"], txt[:80])
+        saw_stats += "Promotion checklist" in txt and "Curve type" in txt
+    assert saw_stats >= 1, "the page with statistics (checklist + curve buckets) was never rendered"
+    for t_, _kb in shown:
+        assert tg_html_ok(t_), t_[:120]
     await lab.cb_lab(FQ("lab:csv:trades")); await lab.cb_lab(FQ("lab:csv:cands"))
     assert len(docs) == 2 and docs[0][0].startswith("lab_trades_") and docs[1][0].startswith("lab_cands_")
     n_before = len(shown)

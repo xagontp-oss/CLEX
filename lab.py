@@ -494,7 +494,7 @@ def criteria(s: Dict) -> List[Tuple[str, bool]]:
         ("lower confidence bound > 0 (corrected for all variants tested)", (s.get("lo_adj") or -1) > 0),
         ("still > 0 after removing the 3 best trades", (s.get("top3_mean") if s.get("top3_mean") is not None else -1) > 0),
         ("both halves of the sample > 0", (s.get("h1") or -1) > 0 and (s.get("h2") or -1) > 0),
-        (f"max drawdown <= {MAX_DD_STAKES:g} stakes", s.get("maxdd", 99) <= MAX_DD_STAKES),
+        (f"max drawdown at most {MAX_DD_STAKES:g} stakes", s.get("maxdd", 99) <= MAX_DD_STAKES),
         (f"mean > 0 even at {STRESS_LATENCY:g}s execution latency", (s.get("l10") or -1) > 0),
     ]
 
@@ -1296,7 +1296,7 @@ async def variant_page(rid: int) -> Tuple[str, "apex.InlineKeyboardMarkup"]:
         lines.append("<b>Curve type</b>")
         for k, (n_, m_) in s["curve"].items():
             lines.append(f"<code>{html.escape(k):18s}</code> n={n_} {_pct(m_, 0)}")
-        lines += [RULE, "<b>Promotion checklist</b>"] + [("✅ " if ok else "❌ ") + t for t, ok in criteria(s)]
+        lines += [RULE, "<b>Promotion checklist</b>"] + [("✅ " if ok else "❌ ") + html.escape(t) for t, ok in criteria(s)]
     else:
         lines.append("No forward trades yet.")
     kb = apex._kb([[("↻", f"lab:v:{rid}"), ("‹ Variants", "lab:vars:0")], [("‹ Lab", "lab:home")]])
