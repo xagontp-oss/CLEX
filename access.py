@@ -344,7 +344,8 @@ async def _admin_home():
             f"<code>Invites   </code>{len(pending_invites())} pending\n"
             f"{RULE}\n<i>Only you can see this panel.</i>")
     return text, _kb([[("👥 Users", "adm:users:0"), ("➕ New invite link", "adm:inv")],
-                      [("🔗 Pending invites", "adm:invs"), ("🗄 Data", "adm:data")], [("‹ Home", "ax:home")]])
+                      [("🔗 Pending invites", "adm:invs"), ("🗄 Data", "adm:data")],
+                      [("🧪 Lab", "lab:home")], [("‹ Home", "ax:home")]])
 
 
 @router.message(Command("admin"))

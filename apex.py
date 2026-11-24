@@ -2120,6 +2120,12 @@ async def on_pool_event(tx: Dict):
         if pool.mint in _seen:
             return
         _seen[pool.mint] = time.time()
+        if is_pump:
+            try:
+                import lab                         # research journal: independent of live users, never raises
+                lab.on_launch(pool)
+            except Exception as e:
+                logger.debug(f"lab hook: {e}")
         if not await _active_users():
             _stats["idle_skips"] += 1     # nobody is trading: spend zero credits
             return
